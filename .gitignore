@@ -1,0 +1,8 @@
+# Instagram export + downloaded media + login session — never commit these
+saved_posts.json
+downloads/
+*.session
+.downloaded.txt
+failures.log
+__pycache__/
+*.pyc
