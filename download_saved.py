@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Download the media behind your Instagram saved posts.
 
-This reads the ``saved_posts.json`` file from Instagram's official
-"Download your information" export, then uses Instaloader (logged in as you)
-to download the media + metadata for each saved post to a local folder.
+This reads your Instagram "Download your information" export (either the JSON
+or the HTML format) and uses Instaloader (logged in as you) to download the
+media + metadata for each saved post to a local folder.
 
 Layout on disk::
 
@@ -16,6 +16,11 @@ It can also:
   * filter to a single saved *collection* with ``--collection "Name"``
   * write a CSV list of your saved posts (no downloading, no login) with
     ``--csv saved.csv``
+  * list the collections it detects with ``--list-collections``
+
+Both export formats are supported and auto-detected by file extension:
+  * saved_posts.json / saved_collections.json  (choose JSON at export time)
+  * saved_posts.html / saved_collections.html  (choose HTML at export time)
 
 Run ``python download_saved.py --help`` for options.
 
@@ -34,6 +39,7 @@ import re
 import sys
 import time
 from datetime import datetime, timezone
+from html.parser import HTMLParser
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -47,6 +53,12 @@ except ImportError:
 _POST_PATH_PREFIXES = ("p", "reel", "reels", "tv")
 # Matches a shortcode anywhere inside a blob of text/JSON.
 _SHORTCODE_RE = re.compile(r"instagram\.com/(?:p|reel|reels|tv)/([A-Za-z0-9_-]+)")
+# A plausible Instagram username (used to pick the author out of HTML exports).
+_USERNAME_RE = re.compile(r"^[A-Za-z0-9._]{1,30}$")
+# A date like "Jan 15, 2024 3:45:12pm" as rendered in Meta's HTML exports.
+_DATE_RE = re.compile(
+    r"\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2},?\s+\d{4}", re.I
+)
 
 
 def shortcode_from_url(url: str) -> str | None:
@@ -57,6 +69,9 @@ def shortcode_from_url(url: str) -> str | None:
     return None
 
 
+# --------------------------------------------------------------------------- #
+# JSON export parsing
+# --------------------------------------------------------------------------- #
 def _first_href_and_timestamp(item: dict) -> tuple[str, int | None]:
     """Pull the post link and (optional) 'saved on' timestamp from an entry."""
     smd = item.get("string_map_data", {})
@@ -66,58 +81,46 @@ def _first_href_and_timestamp(item: dict) -> tuple[str, int | None]:
     return "", None
 
 
-def parse_saved_export(path: Path) -> list[dict]:
-    """Parse saved_posts.json into a list of post records.
+def _date_from_timestamp(ts: int | None) -> str:
+    if not ts:
+        return ""
+    return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d")
 
-    Each record: {shortcode, author, url, saved_on (int|None)}.
-    Handles the current Instagram export shape::
 
-        {"saved_saved_media": [
-            {"title": "author_username",
-             "string_map_data": {"Saved on": {"href": ".../p/CODE/",
-                                              "timestamp": 1699999999}}},
-            ...
-        ]}
-    """
+def parse_saved_export_json(path: Path) -> list[dict]:
+    """Parse saved_posts.json into a list of post records."""
     data = json.loads(path.read_text(encoding="utf-8"))
     entries = data.get("saved_saved_media", data) if isinstance(data, dict) else data
     if not isinstance(entries, list):
         raise ValueError(
-            f"Unexpected export format in {path}. Expected a 'saved_saved_media' "
-            "list from Instagram's saved_posts.json."
+            f"Unexpected JSON export format in {path}. Expected a "
+            "'saved_saved_media' list from Instagram's saved_posts.json."
         )
-
-    results: list[dict] = []
+    records: list[dict] = []
     for item in entries:
         if not isinstance(item, dict):
             continue
         href, ts = _first_href_and_timestamp(item)
         code = shortcode_from_url(href)
         if code:
-            results.append(
+            records.append(
                 {
                     "shortcode": code,
                     "author": item.get("title") or None,
                     "url": href,
-                    "saved_on": ts,
+                    "date_saved": _date_from_timestamp(ts),
                 }
             )
-    return results
+    return records
 
 
-def collection_shortcodes(path: Path, name: str) -> set[str]:
-    """Return the shortcodes belonging to a named saved collection.
-
-    Instagram's collections file has varied in shape over the years, so rather
-    than assume an exact schema we find the entry matching ``name`` and then
-    scrape every post shortcode out of that entry's raw JSON. If ``name`` is
-    not found, raise with the list of collection names we *did* see.
-    """
+def collection_map_json(path: Path) -> dict[str, set[str]]:
+    """Map each collection name -> set of shortcodes, from the JSON export."""
     data = json.loads(path.read_text(encoding="utf-8"))
     entries = data.get("saved_saved_collections", data) if isinstance(data, dict) else data
     if not isinstance(entries, list):
         raise ValueError(
-            f"Unexpected collections format in {path}. Expected a "
+            f"Unexpected JSON collections format in {path}. Expected a "
             "'saved_saved_collections' list."
         )
 
@@ -130,22 +133,146 @@ def collection_shortcodes(path: Path, name: str) -> set[str]:
                 return smd[key]["value"]
         return ""
 
-    available = []
+    result: dict[str, set[str]] = {}
     for entry in entries:
         if not isinstance(entry, dict):
             continue
-        this_name = entry_name(entry)
-        available.append(this_name)
-        if this_name.strip().lower() == name.strip().lower():
-            blob = json.dumps(entry)
-            return set(_SHORTCODE_RE.findall(blob))
-
-    raise SystemExit(
-        f"Collection {name!r} not found in {path}.\n"
-        f"Collections found: {', '.join(repr(n) for n in available if n) or '(none)'}"
-    )
+        name = entry_name(entry)
+        if name:
+            result[name] = set(_SHORTCODE_RE.findall(json.dumps(entry)))
+    return result
 
 
+# --------------------------------------------------------------------------- #
+# HTML export parsing
+# --------------------------------------------------------------------------- #
+class _MetaExportParser(HTMLParser):
+    """Flattens a Meta HTML export into an ordered token stream.
+
+    Each token is either ("text", str) for a run of visible text, or
+    ("link", shortcode, url) for an anchor pointing at an Instagram post.
+    Class names in these exports are obfuscated and change over time, so we
+    rely on this order-preserving stream rather than any specific markup.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.tokens: list[tuple] = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "a":
+            href = dict(attrs).get("href", "") or ""
+            code = shortcode_from_url(href)
+            if code:
+                self.tokens.append(("link", code, href))
+
+    def handle_data(self, data):
+        text = data.strip()
+        if text:
+            self.tokens.append(("text", text))
+
+
+def _parse_html_tokens(path: Path) -> list[tuple]:
+    parser = _MetaExportParser()
+    parser.feed(path.read_text(encoding="utf-8", errors="replace"))
+    return parser.tokens
+
+
+def _is_meta_text(text: str) -> bool:
+    """True if a text token is a URL, a date, or a 'Saved on' label (not a name)."""
+    low = text.lower()
+    return low.startswith("http") or low.startswith("saved on") or bool(_DATE_RE.search(text))
+
+
+def parse_saved_export_html(path: Path) -> list[dict]:
+    """Parse saved_posts.html into a list of post records.
+
+    Shortcodes come straight from the post links (fully reliable). The author
+    username and saved date are best-effort: we take the nearest preceding
+    username-shaped text as the author and the nearest following date as the
+    saved date.
+    """
+    tokens = _parse_html_tokens(path)
+    records: list[dict] = []
+    seen: set[str] = set()
+    for i, tok in enumerate(tokens):
+        if tok[0] != "link":
+            continue
+        code, url = tok[1], tok[2]
+        if code in seen:
+            continue
+        seen.add(code)
+
+        author = None
+        for j in range(i - 1, max(-1, i - 8), -1):
+            t = tokens[j]
+            if t[0] == "text" and not _is_meta_text(t[1]) and _USERNAME_RE.match(t[1]):
+                author = t[1]
+                break
+
+        date_saved = ""
+        for j in range(i + 1, min(len(tokens), i + 8)):
+            t = tokens[j]
+            if t[0] == "text":
+                m = _DATE_RE.search(t[1])
+                if m:
+                    date_saved = m.group(0)
+                    break
+
+        records.append({"shortcode": code, "author": author, "url": url, "date_saved": date_saved})
+    return records
+
+
+def collection_map_html(path: Path) -> dict[str, set[str]]:
+    """Map each collection name -> set of shortcodes, from saved_collections.html.
+
+    Heuristic: a non-URL/non-date text token is treated as the current
+    collection heading, and every post link after it (until the next heading)
+    belongs to that collection. Verify with --list-collections before relying
+    on it, since Meta's HTML layout can vary.
+    """
+    tokens = _parse_html_tokens(path)
+    result: dict[str, set[str]] = {}
+    current: str | None = None
+    for tok in tokens:
+        if tok[0] == "text":
+            if not _is_meta_text(tok[1]):
+                current = tok[1]
+                result.setdefault(current, set())
+        elif tok[0] == "link" and current is not None:
+            result.setdefault(current, set()).add(tok[1])
+    # Drop headings that gathered no posts (stray labels).
+    return {name: codes for name, codes in result.items() if codes}
+
+
+# --------------------------------------------------------------------------- #
+# Format dispatch
+# --------------------------------------------------------------------------- #
+def _is_html(path: Path) -> bool:
+    return path.suffix.lower() in (".html", ".htm")
+
+
+def parse_saved_export(path: Path) -> list[dict]:
+    return parse_saved_export_html(path) if _is_html(path) else parse_saved_export_json(path)
+
+
+def collection_map(path: Path) -> dict[str, set[str]]:
+    return collection_map_html(path) if _is_html(path) else collection_map_json(path)
+
+
+def collection_shortcodes(path: Path, name: str) -> set[str]:
+    """Return the shortcodes for a named collection, or exit listing what exists."""
+    cmap = collection_map(path)
+    for cname, codes in cmap.items():
+        if cname.strip().lower() == name.strip().lower():
+            return codes
+    available = ", ".join(repr(n) for n in cmap) or "(none detected)"
+    raise SystemExit(f"Collection {name!r} not found in {path}.\nCollections found: {available}")
+
+
+# --------------------------------------------------------------------------- #
+# Downloading
+# --------------------------------------------------------------------------- #
 def load_ledger(path: Path) -> set[str]:
     """Return the set of shortcodes already downloaded (for resumability)."""
     if not path.exists():
@@ -164,14 +291,14 @@ def write_csv(path: Path, posts: list[dict], collection: str | None) -> None:
         writer = csv.writer(fh)
         writer.writerow(["author", "shortcode", "url", "date_saved", "collection"])
         for p in posts:
-            ts = p.get("saved_on")
-            date_saved = (
-                datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d")
-                if ts
-                else ""
-            )
             writer.writerow(
-                [p.get("author") or "", p["shortcode"], p.get("url") or "", date_saved, collection or ""]
+                [
+                    p.get("author") or "",
+                    p["shortcode"],
+                    p.get("url") or "",
+                    p.get("date_saved") or "",
+                    collection or "",
+                ]
             )
 
 
@@ -213,7 +340,7 @@ def main() -> int:
         "--export",
         type=Path,
         default=Path("saved_posts.json"),
-        help="Path to saved_posts.json from Instagram's data export.",
+        help="Path to saved_posts.json or saved_posts.html from your export.",
     )
     parser.add_argument(
         "--collection",
@@ -223,8 +350,14 @@ def main() -> int:
     parser.add_argument(
         "--collections-file",
         type=Path,
-        default=Path("saved_collections.json"),
-        help="Path to the collections file from the export (used with --collection).",
+        default=None,
+        help="Path to the collections file (saved_collections.json/.html). "
+        "Defaults to a sibling of --export.",
+    )
+    parser.add_argument(
+        "--list-collections",
+        action="store_true",
+        help="List the collections detected in the collections file, and exit.",
     )
     parser.add_argument(
         "--csv",
@@ -264,11 +397,29 @@ def main() -> int:
     )
     args = parser.parse_args()
 
+    # Default the collections file to sit next to the export file.
+    if args.collections_file is None:
+        suffix = args.export.suffix or ".json"
+        args.collections_file = args.export.with_name(f"saved_collections{suffix}")
+
+    # --list-collections: verify collection parsing with no login/download.
+    if args.list_collections:
+        if not args.collections_file.exists():
+            sys.exit(f"Collections file not found: {args.collections_file}")
+        cmap = collection_map(args.collections_file)
+        if not cmap:
+            print(f"No collections detected in {args.collections_file}.")
+            return 0
+        print(f"Collections detected in {args.collections_file}:")
+        for name, codes in sorted(cmap.items(), key=lambda kv: kv[0].lower()):
+            print(f"  {name!r}: {len(codes)} posts")
+        return 0
+
     if not args.export.exists():
         sys.exit(
             f"Export file not found: {args.export}\n"
             "Get it from Instagram: Settings -> Accounts Center -> Your information and "
-            "permissions -> Download your information (choose JSON). Look for saved_posts.json."
+            "permissions -> Download your information. Look for saved_posts.json or saved_posts.html."
         )
 
     posts = parse_saved_export(args.export)
@@ -280,7 +431,7 @@ def main() -> int:
         if not args.collections_file.exists():
             sys.exit(
                 f"Collections file not found: {args.collections_file}\n"
-                "It comes with the same export as saved_posts.json. Point --collections-file at it."
+                "It comes with the same export as your saved posts. Point --collections-file at it."
             )
         wanted = collection_shortcodes(args.collections_file, args.collection)
         posts = [p for p in posts if p["shortcode"] in wanted]
@@ -318,7 +469,7 @@ def main() -> int:
         sys.exit(
             "Instaloader is not installed, so downloading is unavailable. Run:\n"
             "    pip install -r requirements.txt\n"
-            "(--csv and --dry-run work without it.)"
+            "(--csv, --dry-run and --list-collections work without it.)"
         )
 
     loader = make_loader(args.outdir)
