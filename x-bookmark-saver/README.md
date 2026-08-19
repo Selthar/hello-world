@@ -120,9 +120,13 @@ back to stitching HLS segments and may be video-only.
 - Anything downloaded before is remembered and not queued twice. Settings →
   "Clear download history" makes them eligible again.
 
-**Un-bookmarking does nothing:**
-- Keep the X tab open — the request has to come from the page to carry your
-  session.
+**Un-bookmarking looks like it did nothing:**
+- Check X itself before assuming it failed. Tweets that were off screen are
+  removed through the API, which X's page does not notice until it reloads.
+  The extension hides those rows for you, but the count in X's own UI can stay
+  stale until you refresh.
+- Keep the X tab open and stay on the bookmarks page — removals go through the
+  page so they carry your session.
 - If you see "Bookmark API details not captured yet", reload the bookmarks page
   and wait a few seconds before retrying.
 

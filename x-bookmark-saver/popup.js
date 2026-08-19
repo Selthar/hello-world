@@ -355,8 +355,9 @@ document.addEventListener('DOMContentLoaded', async () => {
     btn.disabled = false;
     btn.textContent = 'Unbookmark';
 
-    if (resp?.ok) {
-      toast(`Unbookmarked ${resp.unbookmarked} of ${result.count} tweets ✓`, 'success', 4000);
+    if (resp?.unbookmarked > 0) {
+      const suffix = resp.failed > 0 ? `, ${resp.failed} failed` : '';
+      toast(`Unbookmarked ${resp.unbookmarked} of ${result.count}${suffix} ✓`, resp.failed > 0 ? 'info' : 'success', 4000);
     } else {
       toast(resp?.error || 'Unbookmark failed — reload X and try again', 'error', 4500);
     }
@@ -403,6 +404,9 @@ chrome.runtime.onMessage.addListener((msg) => {
     }
   } else if (msg.type === 'QUEUE_UPDATED') {
     loadQueue();
+  } else if (msg.type === 'UNBOOKMARK_PROGRESS') {
+    const btn = $('btn-unbookmark-downloaded');
+    if (btn?.disabled) btn.textContent = `${msg.done}/${msg.total}`;
   } else if (msg.type === 'DOWNLOAD_DONE') {
     finishDownloadAll(msg.downloaded, msg.failed, msg.unbookmarked);
   }

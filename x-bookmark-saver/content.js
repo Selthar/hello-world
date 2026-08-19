@@ -138,6 +138,115 @@
     return items;
   }
 
+  // ── Un-bookmarking ───────────────────────────────────────────────────────────
+  //
+  // Two routes. Clicking X's own button is preferred: X updates its own store,
+  // so the row disappears immediately and the request carries whatever headers
+  // X currently requires. Calling the API directly works but leaves the page
+  // showing a stale list until it reloads, so anything removed that way is
+  // hidden by hand.
+
+  const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+  function findArticle(statusId) {
+    for (const article of document.querySelectorAll('article')) {
+      if (article.querySelector(`a[href*="/status/${statusId}"]`)) return article;
+    }
+    return null;
+  }
+
+  async function unbookmarkViaUi(statusId) {
+    const article = findArticle(statusId);
+    if (!article) return false;
+
+    const button = article.querySelector('[data-testid="removeBookmark"]');
+    if (!button) return false;
+
+    button.click();
+
+    // X either drops the row from the timeline or flips the button back to
+    // "bookmark". Either means it took.
+    for (let i = 0; i < 12; i++) {
+      await sleep(120);
+      if (!article.isConnected) return true;
+      if (!article.querySelector('[data-testid="removeBookmark"]')) return true;
+    }
+    return false;
+  }
+
+  function hideArticle(statusId) {
+    const article = findArticle(statusId);
+    const row = article?.closest('[data-testid="cellInnerDiv"]') || article;
+    if (row) row.style.display = 'none';
+  }
+
+  async function unbookmarkViaApi(statusId, credentials) {
+    const { queryId, bearer, csrf } = credentials;
+    const resp = await fetch(`https://x.com/i/api/graphql/${queryId}/DeleteBookmark`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${bearer}`,
+        'X-Csrf-Token': csrf,
+        'X-Twitter-Active-User': 'yes',
+        'X-Twitter-Auth-Type': 'OAuth2Session',
+        'X-Twitter-Client-Language': 'en'
+      },
+      body: JSON.stringify({ variables: { tweet_id: statusId }, queryId }),
+      credentials: 'include'
+    });
+
+    const body = await resp.json().catch(() => null);
+    // X answers 200 with an errors[] array on failure, so check both.
+    if (!resp.ok || body?.errors?.length) {
+      throw new Error(body?.errors?.[0]?.message || `HTTP ${resp.status}`);
+    }
+  }
+
+  async function unbookmarkAll(statusIds) {
+    const stored = await chrome.storage.local.get(AUTH_KEY).catch(() => ({}));
+    auth = { ...(stored[AUTH_KEY] || {}), ...auth };
+
+    const credentials = {
+      queryId: auth.DeleteBookmarkQueryId,
+      bearer: auth.bearerToken,
+      csrf: document.cookie.match(/ct0=([^;]+)/)?.[1] || auth.csrfToken || null
+    };
+    const canUseApi = Boolean(credentials.queryId && credentials.bearer && credentials.csrf);
+
+    let unbookmarked = 0;
+    let viaUi = 0;
+    const failures = [];
+
+    for (let i = 0; i < statusIds.length; i++) {
+      const sid = statusIds[i];
+      try {
+        if (await unbookmarkViaUi(sid)) {
+          unbookmarked++;
+          viaUi++;
+        } else if (canUseApi) {
+          await unbookmarkViaApi(sid, credentials);
+          hideArticle(sid); // the page won't do it for us
+          unbookmarked++;
+          await sleep(300); // stay under X's rate limit
+        } else {
+          failures.push('Bookmark API details not captured yet — reload the bookmarks page');
+        }
+      } catch (e) {
+        failures.push(e.message);
+      }
+
+      chrome.runtime.sendMessage({
+        type: 'UNBOOKMARK_PROGRESS', done: i + 1, total: statusIds.length
+      }).catch(() => {});
+    }
+
+    if (failures.length > 0) console.warn('[XBMS] unbookmark failures:', failures.slice(0, 5));
+    console.log(`[XBMS] unbookmarked ${unbookmarked}/${statusIds.length} (${viaUi} via X's own button)`);
+
+    return { ok: failures.length < statusIds.length, unbookmarked, failed: failures.length, error: failures[0] || null };
+  }
+
   // ── Messages ─────────────────────────────────────────────────────────────────
 
   chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
@@ -152,57 +261,7 @@
       sendResponse({ isBookmarksPage: checkIfBookmarksPage() });
 
     } else if (msg.type === 'UNBOOKMARK_ITEMS') {
-      (async () => {
-        const { statusIds = [] } = msg;
-
-        const stored = await chrome.storage.local.get(AUTH_KEY).catch(() => ({}));
-        auth = { ...(stored[AUTH_KEY] || {}), ...auth };
-
-        const csrf = document.cookie.match(/ct0=([^;]+)/)?.[1] || auth.csrfToken || null;
-        if (!csrf) { sendResponse({ ok: false, error: 'Not signed in to X (no CSRF token)' }); return; }
-
-        const queryId = auth.DeleteBookmarkQueryId;
-        const bearer = auth.bearerToken;
-        if (!queryId || !bearer) {
-          sendResponse({
-            ok: false,
-            error: 'Bookmark API details not captured yet — reload the bookmarks page and try again'
-          });
-          return;
-        }
-
-        let unbookmarked = 0;
-        const failures = [];
-
-        for (const sid of statusIds) {
-          try {
-            const resp = await fetch(`https://x.com/i/api/graphql/${queryId}/DeleteBookmark`, {
-              method: 'POST',
-              headers: {
-                'Content-Type': 'application/json',
-                'Authorization': `Bearer ${bearer}`,
-                'X-Csrf-Token': csrf,
-                'X-Twitter-Active-User': 'yes',
-                'X-Twitter-Auth-Type': 'OAuth2Session',
-                'X-Twitter-Client-Language': 'en'
-              },
-              body: JSON.stringify({ variables: { tweet_id: sid }, queryId }),
-              credentials: 'include'
-            });
-
-            const body = await resp.json().catch(() => null);
-            // X answers 200 with an errors[] array on failure, so check both.
-            if (resp.ok && !body?.errors?.length) unbookmarked++;
-            else failures.push(body?.errors?.[0]?.message || `HTTP ${resp.status}`);
-          } catch (e) {
-            failures.push(e.message);
-          }
-          await new Promise(r => setTimeout(r, 350));
-        }
-
-        if (failures.length > 0) console.warn('[XBMS] unbookmark failures:', failures.slice(0, 5));
-        sendResponse({ ok: true, unbookmarked, failed: failures.length, error: failures[0] || null });
-      })();
+      (async () => { sendResponse(await unbookmarkAll(msg.statusIds || [])); })();
       return true;
     }
 
