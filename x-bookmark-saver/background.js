@@ -3,6 +3,17 @@ importScripts('zipper.js');
 
 const STORAGE_KEY = 'xbms_queue';
 const DOWNLOADED_KEY = 'xbms_downloaded';
+const RUN_KEY = 'xbms_run';
+const RATE_LOG_KEY = 'xbms_unbookmark_log';
+const KEEPALIVE_ALARM = 'xbms_keepalive';
+
+// Removals are writes against the account, so they are capped over a rolling
+// hour. The log lives in storage so the cap holds across runs and restarts.
+const UNBOOKMARK_HOURLY_CAP = 200;
+const DEFAULT_UNBOOKMARK_DELAY_MS = 2000;
+// Generous, and only counts unexpected errors — a tweet that is already gone
+// is not a failure. This exists to catch something systemically broken.
+const CONSECUTIVE_FAILURE_LIMIT = 10;
 
 // Media fetches are ordinary CDN reads, but they still go out one at a time
 // with a gap between them, and back off when a server asks us to.
@@ -261,7 +272,7 @@ async function downloadAllAsZip(toDownload, onProgress, settings = {}) {
         break;
       }
     }
-    onProgress({ completed: completed + failed, total, downloaded: completed, failed, lastItemId: item.id });
+    await onProgress({ completed: completed + failed, total, downloaded: completed, failed, lastItemId: item.id });
     if (i < toDownload.length - 1 && delayMs > 0) await sleep(jittered(delayMs));
   }
 
@@ -422,6 +433,147 @@ async function exportHistory() {
   return { ok: true, count: rows.length, filename };
 }
 
+// ─── RUN STATE ───────────────────────────────────────────────────────────────
+//
+// Long jobs are owned by the worker, not the popup, and their progress lives in
+// storage. Closing the popup does not stop anything, and reopening it shows the
+// run still going. An alarm resurrects the worker if Chrome shuts it down
+// mid-run.
+
+async function getRun() {
+  const result = await chrome.storage.local.get(RUN_KEY);
+  return result[RUN_KEY] || null;
+}
+
+async function setRun(run) {
+  await chrome.storage.local.set({ [RUN_KEY]: run });
+  chrome.runtime.sendMessage({ type: 'RUN_UPDATED', run }).catch(() => {});
+}
+
+async function clearRun(summary) {
+  await chrome.storage.local.remove(RUN_KEY);
+  chrome.alarms.clear(KEEPALIVE_ALARM);
+  chrome.runtime.sendMessage({ type: 'RUN_DONE', ...summary }).catch(() => {});
+}
+
+function startKeepalive() {
+  chrome.alarms.create(KEEPALIVE_ALARM, { periodInMinutes: 0.5 });
+}
+
+async function recentRemovals() {
+  const stored = await chrome.storage.local.get(RATE_LOG_KEY);
+  const cutoff = Date.now() - 60 * 60 * 1000;
+  return (stored[RATE_LOG_KEY] || []).filter(t => t > cutoff);
+}
+
+// ─── UNBOOKMARK RUNS ─────────────────────────────────────────────────────────
+
+let unbookmarkLoopActive = false;
+
+async function startUnbookmarkRun(statusIds, settings = {}) {
+  if (statusIds.length === 0) return { ok: false, error: 'Nothing to unbookmark' };
+  const existing = await getRun();
+  if (existing?.active) return { ok: false, error: 'A run is already in progress' };
+
+  await setRun({
+    kind: 'unbookmark', active: true, ids: statusIds, index: 0,
+    done: 0, failed: 0, total: statusIds.length,
+    settings, startedAt: Date.now(), stoppedReason: null
+  });
+  startKeepalive();
+  driveUnbookmarkRun();
+  return { ok: true, started: true, total: statusIds.length };
+}
+
+async function driveUnbookmarkRun() {
+  if (unbookmarkLoopActive) return;
+  unbookmarkLoopActive = true;
+
+  try {
+    let consecutiveFailures = 0;
+
+    while (true) {
+      const run = await getRun();
+      if (!run?.active || run.kind !== 'unbookmark') break;
+
+      if (run.index >= run.ids.length) {
+        await clearRun({ kind: 'unbookmark', done: run.done, failed: run.failed, stoppedReason: null });
+        break;
+      }
+
+      const rateLog = await recentRemovals();
+      if (rateLog.length >= UNBOOKMARK_HOURLY_CAP) {
+        await stopUnbookmarkRun(run, `Hourly limit reached (${UNBOOKMARK_HOURLY_CAP}) — resume later`);
+        break;
+      }
+
+      const tab = await findXTab();
+      if (!tab) {
+        await stopUnbookmarkRun(run, 'No X tab open — open x.com and start again');
+        break;
+      }
+
+      const statusId = run.ids[run.index];
+      let result;
+      try {
+        result = await chrome.tabs.sendMessage(tab.id, { type: 'UNBOOKMARK_ONE', statusId });
+      } catch {
+        result = { ok: false, fatal: 'page', error: 'X page not ready — reload it and start again' };
+      }
+
+      // Anything fatal applies to the whole run; everything else is one tweet's
+      // problem and the run carries on.
+      if (result?.fatal) {
+        await stopUnbookmarkRun(run, result.error || 'Stopped');
+        break;
+      }
+
+      if (result?.ok) {
+        rateLog.push(Date.now());
+        await chrome.storage.local.set({ [RATE_LOG_KEY]: rateLog });
+        consecutiveFailures = 0;
+      } else {
+        consecutiveFailures++;
+        console.warn('[XBMS] unbookmark failed for', statusId, result?.error);
+      }
+
+      await setRun({
+        ...run,
+        index: run.index + 1,
+        done: run.done + (result?.ok ? 1 : 0),
+        failed: run.failed + (result?.ok ? 0 : 1)
+      });
+
+      if (consecutiveFailures >= CONSECUTIVE_FAILURE_LIMIT) {
+        const latest = await getRun();
+        await stopUnbookmarkRun(latest, `Stopped after ${consecutiveFailures} failures in a row: ${result?.error || 'unknown error'}`);
+        break;
+      }
+
+      const delay = Number(run.settings?.unbookmarkDelayMs) > 0
+        ? Number(run.settings.unbookmarkDelayMs)
+        : DEFAULT_UNBOOKMARK_DELAY_MS;
+      await sleep(jittered(delay));
+    }
+  } finally {
+    unbookmarkLoopActive = false;
+  }
+}
+
+async function stopUnbookmarkRun(run, reason) {
+  console.warn('[XBMS] unbookmark run stopped:', reason);
+  await clearRun({ kind: 'unbookmark', done: run?.done || 0, failed: run?.failed || 0, stoppedReason: reason });
+}
+
+// Chrome can shut the worker down mid-run; the alarm brings it back and the
+// loop picks up from the stored index.
+chrome.alarms.onAlarm.addListener(async (alarm) => {
+  if (alarm.name !== KEEPALIVE_ALARM) return;
+  const run = await getRun();
+  if (run?.active && run.kind === 'unbookmark') driveUnbookmarkRun();
+  else if (!run?.active) chrome.alarms.clear(KEEPALIVE_ALARM);
+});
+
 // ─── UNBOOKMARKING ───────────────────────────────────────────────────────────
 
 async function findXTab() {
@@ -429,17 +581,6 @@ async function findXTab() {
   return tabs.find(t => t.url?.includes('x.com/i/bookmarks'))
     || tabs.find(t => t.url?.includes('x.com') || t.url?.includes('twitter.com'))
     || null;
-}
-
-async function unbookmarkStatusIds(statusIds, settings = {}) {
-  if (statusIds.length === 0) return { ok: true, unbookmarked: 0 };
-  const tab = await findXTab();
-  if (!tab) return { ok: false, error: 'No X tab open' };
-  try {
-    return await chrome.tabs.sendMessage(tab.id, { type: 'UNBOOKMARK_ITEMS', statusIds, settings });
-  } catch (e) {
-    return { ok: false, error: e.message };
-  }
 }
 
 // ─── MESSAGES ────────────────────────────────────────────────────────────────
@@ -478,11 +619,21 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           const toDownload = queue.filter(i => i.status === 'queued').slice(0, batchSize);
           if (toDownload.length === 0) return;
 
+          await setRun({
+            kind: 'download', active: true, index: 0, done: 0, failed: 0,
+            total: toDownload.length, startedAt: Date.now(), stoppedReason: null
+          });
+          startKeepalive();
+
           try {
             const { completed, failed, failedItems, succeededItems, stoppedReason } = await downloadAllAsZip(
               toDownload,
-              (progress) => {
-                chrome.runtime.sendMessage({ type: 'DOWNLOAD_PROGRESS', ...progress }).catch(() => {});
+              async (progress) => {
+                await setRun({
+                  kind: 'download', active: true, index: progress.completed,
+                  done: progress.downloaded, failed: progress.failed,
+                  total: progress.total, stoppedReason: null
+                });
               },
               settings
             );
@@ -490,27 +641,34 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             for (const item of succeededItems) await markDownloaded(item.id);
             for (const item of failedItems) await markFailed(item.id, 'fetch error');
 
-            let unbookmarked = 0;
+            // Close out the download run before starting the removal run —
+            // only one run is active at a time.
+            await clearRun({ kind: 'download', done: completed, failed, stoppedReason });
+
             if (unbookmark && succeededItems.length > 0) {
               // One tweet can hold several media items — unbookmark each once.
               const statusIds = [...new Set(succeededItems.map(i => i.statusId).filter(Boolean))];
-              const result = await unbookmarkStatusIds(statusIds, settings);
-              unbookmarked = result?.unbookmarked || 0;
+              const result = await startUnbookmarkRun(statusIds, settings);
               if (!result?.ok) console.warn('[XBMS] unbookmark after save failed:', result?.error);
             }
 
-            chrome.runtime.sendMessage({
-              type: 'DOWNLOAD_DONE',
-              downloaded: completed, failed, unbookmarked, stoppedReason, total: toDownload.length
-            }).catch(() => {});
-
           } catch (err) {
-            chrome.runtime.sendMessage({
-              type: 'DOWNLOAD_DONE',
-              downloaded: 0, failed: toDownload.length, total: toDownload.length, error: err.message
-            }).catch(() => {});
+            await clearRun({
+              kind: 'download', done: 0, failed: toDownload.length, stoppedReason: err.message
+            });
           }
         })();
+
+      } else if (msg.type === 'START_UNBOOKMARK') {
+        sendResponse(await startUnbookmarkRun(msg.statusIds || [], msg.settings || {}));
+
+      } else if (msg.type === 'GET_RUN') {
+        sendResponse({ run: await getRun() });
+
+      } else if (msg.type === 'CANCEL_RUN') {
+        const run = await getRun();
+        if (run) await clearRun({ kind: run.kind, done: run.done, failed: run.failed, stoppedReason: 'Cancelled' });
+        sendResponse({ ok: true });
 
       } else if (msg.type === 'EXPORT_HISTORY') {
         sendResponse(await exportHistory());

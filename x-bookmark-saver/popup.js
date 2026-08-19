@@ -3,6 +3,7 @@
 let allQueue = [];
 let currentFilter = 'queued';
 let isDownloading = false;
+let activeRun = null;
 
 // Settings state — loaded from storage on init
 let settings = {
@@ -92,6 +93,7 @@ function updateStats() {
   $('stat-total').textContent = allQueue.length;
 
   $('btn-download-all').disabled = queued === 0 || isDownloading;
+  if (activeRun?.kind === 'unbookmark') $('btn-unbookmark-downloaded').disabled = true;
 }
 
 function getFilteredItems() {
@@ -160,6 +162,48 @@ function renderList() {
 
 function escHtml(str) {
   return String(str || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+// ─── RUN STATE ──────────────────────────────────────────────────────────────
+//
+// Long jobs run in the background worker, so the popup reflects their state
+// rather than owning it. Closing the popup does not stop anything.
+
+function renderRun(run) {
+  activeRun = run && run.active ? run : null;
+  isDownloading = Boolean(activeRun && activeRun.kind === 'download');
+
+  const progressBar = $('progress-bar');
+  const progressFill = $('progress-fill');
+  const dlBtn = $('btn-download-all');
+  const unBtn = $('btn-unbookmark-downloaded');
+
+  if (!activeRun) {
+    progressBar.style.display = 'none';
+    progressFill.style.width = '0%';
+    unBtn.disabled = false;
+    unBtn.textContent = 'Unbookmark';
+    dlBtn.innerHTML = `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg> Download All`;
+    updateStats();
+    return;
+  }
+
+  const pct = activeRun.total > 0 ? (activeRun.index / activeRun.total) * 100 : 0;
+  progressBar.style.display = 'block';
+  progressFill.style.width = `${pct}%`;
+
+  if (activeRun.kind === 'download') {
+    dlBtn.disabled = true;
+    dlBtn.innerHTML = `<span class="spinner"></span> Saving ${activeRun.index}/${activeRun.total}`;
+  } else {
+    unBtn.disabled = true;
+    unBtn.textContent = `${activeRun.index}/${activeRun.total}`;
+  }
+}
+
+async function restoreRun() {
+  const result = await sendBg({ type: 'GET_RUN' });
+  renderRun(result?.run || null);
 }
 
 // ─── STATUS BAR ──────────────────────────────────────────────────────────────
@@ -250,42 +294,32 @@ async function downloadAll() {
   isDownloading = true;
   const btn = $('btn-download-all');
   btn.disabled = true;
-  btn.innerHTML = '<span class="spinner"></span> Building zip...';
+  btn.innerHTML = '<span class="spinner"></span> Starting...';
 
-  const progressBar = $('progress-bar');
-  const progressFill = $('progress-fill');
-  progressBar.style.display = 'block';
-  progressFill.style.width = '0%';
-
-  // Fire off to background — it handles the full loop reliably
-  // without depending on the popup staying open
+  // The worker owns the run from here — closing the popup does not stop it.
   await sendBg({ type: 'DOWNLOAD_ALL', settings });
-  // Progress/completion comes back via DOWNLOAD_PROGRESS / DOWNLOAD_DONE messages
+  await restoreRun();
 }
 
-function finishDownloadAll(downloaded, failed, unbookmarked = 0, stoppedReason = null) {
-  isDownloading = false;
-  const btn = $('btn-download-all');
-  if (btn) {
-    btn.innerHTML = `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg> Download All`;
-  }
+function finishRun(msg) {
+  renderRun(null);
   loadQueue();
-  const progressBar = $('progress-bar');
-  const progressFill = $('progress-fill');
-  if (progressFill) progressFill.style.width = '100%';
-  setTimeout(() => {
-    if (progressBar) progressBar.style.display = 'none';
-    if (progressFill) progressFill.style.width = '0%';
-  }, 1200);
 
-  if (stoppedReason) {
-    toast(`${downloaded} saved — ${stoppedReason}`, 'info', 6000);
+  if (msg.kind === 'unbookmark') {
+    if (msg.stoppedReason) toast(`Unbookmarked ${msg.done} — ${msg.stoppedReason}`, 'info', 6000);
+    else if (msg.failed > 0) toast(`Unbookmarked ${msg.done}, ${msg.failed} failed`, 'info', 4000);
+    else toast(`Unbookmarked ${msg.done} tweets ✓`, 'success', 3500);
     return;
   }
-  const parts = [`${downloaded} saved`];
-  if (failed > 0) parts.push(`${failed} failed`);
-  if (unbookmarked > 0) parts.push(`${unbookmarked} unbookmarked`);
-  toast(parts.join(', '), failed > 0 ? 'info' : 'success', 3500);
+
+  if (msg.stoppedReason) {
+    toast(`${msg.done} saved — ${msg.stoppedReason}`, 'info', 6000);
+    return;
+  }
+  const parts = [`${msg.done} saved`];
+  if (msg.failed > 0) parts.push(`${msg.failed} failed`);
+  if (msg.unbookmarked > 0) parts.push(`${msg.unbookmarked} unbookmarked`);
+  toast(parts.join(', '), msg.failed > 0 ? 'info' : 'success', 3500);
 }
 
 async function clearQueue() {
@@ -305,6 +339,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   applySettingsToUI();
   await updateStatusBar();
   await loadQueue();
+  await restoreRun();
 
   // Filter tabs
   document.querySelectorAll('.tab').forEach(tab => {
@@ -401,26 +436,17 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     if (!confirm(`Unbookmark ${result.count} tweet${result.count !== 1 ? 's' : ''} from X? This cannot be undone.`)) return;
 
-    const btn = $('btn-unbookmark-downloaded');
-    btn.disabled = true;
-    btn.textContent = 'Working...';
-
-    const resp = await sendContent(tab, {
-      type: 'UNBOOKMARK_ITEMS',
+    const started = await sendBg({
+      type: 'START_UNBOOKMARK',
       statusIds: result.statusIds,
       settings
     });
 
-    btn.disabled = false;
-    btn.textContent = 'Unbookmark';
-
-    if (resp?.stoppedReason) {
-      toast(`Stopped at ${resp.unbookmarked} of ${result.count}: ${resp.stoppedReason}`, 'info', 6000);
-    } else if (resp?.unbookmarked > 0) {
-      const suffix = resp.failed > 0 ? `, ${resp.failed} failed` : '';
-      toast(`Unbookmarked ${resp.unbookmarked} of ${result.count}${suffix} ✓`, resp.failed > 0 ? 'info' : 'success', 4000);
+    if (started?.ok) {
+      await restoreRun();
+      toast(`Unbookmarking ${started.total} — you can close this popup`, 'info', 4000);
     } else {
-      toast(resp?.error || 'Unbookmark failed — reload X and try again', 'error', 4500);
+      toast(started?.error || 'Could not start', 'error', 4000);
     }
   });
 
@@ -456,19 +482,9 @@ document.addEventListener('DOMContentLoaded', async () => {
   });
 });
 
-// Listen for progress/completion from background while popup is open
+// The worker drives everything; the popup just reflects it.
 chrome.runtime.onMessage.addListener((msg) => {
-  if (msg.type === 'DOWNLOAD_PROGRESS') {
-    const progressFill = $('progress-fill');
-    if (progressFill && msg.total > 0) {
-      progressFill.style.width = `${(msg.completed / msg.total) * 100}%`;
-    }
-  } else if (msg.type === 'QUEUE_UPDATED') {
-    loadQueue();
-  } else if (msg.type === 'UNBOOKMARK_PROGRESS') {
-    const btn = $('btn-unbookmark-downloaded');
-    if (btn?.disabled) btn.textContent = `${msg.done}/${msg.total}`;
-  } else if (msg.type === 'DOWNLOAD_DONE') {
-    finishDownloadAll(msg.downloaded, msg.failed, msg.unbookmarked, msg.stoppedReason);
-  }
+  if (msg.type === 'RUN_UPDATED') renderRun(msg.run);
+  else if (msg.type === 'RUN_DONE') finishRun(msg);
+  else if (msg.type === 'QUEUE_UPDATED') loadQueue();
 });

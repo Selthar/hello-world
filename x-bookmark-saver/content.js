@@ -9,14 +9,6 @@
   'use strict';
 
   const AUTH_KEY = 'xbms_auth';
-  const RATE_LOG_KEY = 'xbms_unbookmark_log';
-
-  // Removals are writes against your account, so they are paced deliberately.
-  // The cap is a rolling one-hour window, kept in storage so it survives
-  // reloads and applies across every batch.
-  const DEFAULT_DELAY_MS = 2000;
-  const HOURLY_CAP = 200;
-  const CONSECUTIVE_FAILURE_LIMIT = 3;
 
   let isBookmarksPage = false;
   let auth = {};
@@ -156,22 +148,6 @@
 
   const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-  // Spread requests out so the timing doesn't look metronomic.
-  function jittered(ms) {
-    return Math.round(ms * (0.6 + Math.random() * 0.8));
-  }
-
-  async function recentRemovals() {
-    const stored = await chrome.storage.local.get(RATE_LOG_KEY).catch(() => ({}));
-    const cutoff = Date.now() - 60 * 60 * 1000;
-    return (stored[RATE_LOG_KEY] || []).filter(t => t > cutoff);
-  }
-
-  async function recordRemoval(log) {
-    log.push(Date.now());
-    await chrome.storage.local.set({ [RATE_LOG_KEY]: log }).catch(() => {});
-  }
-
   function findArticle(statusId) {
     for (const article of document.querySelectorAll('article')) {
       if (article.querySelector(`a[href*="/status/${statusId}"]`)) return article;
@@ -234,7 +210,19 @@
     }
   }
 
-  async function unbookmarkAll(statusIds, settings = {}) {
+  // Errors that mean "this tweet is already in the state we want" are not
+  // failures — the bookmark is gone either way.
+  function isAlreadyGone(message) {
+    return /not ?found|does not exist|no status found|already/i.test(message || '');
+  }
+
+  async function unbookmarkOne(statusId) {
+    try {
+      if (await unbookmarkViaUi(statusId)) return { ok: true, via: 'ui' };
+    } catch (e) {
+      console.warn('[XBMS] UI removal threw for', statusId, e.message);
+    }
+
     const stored = await chrome.storage.local.get(AUTH_KEY).catch(() => ({}));
     auth = { ...(stored[AUTH_KEY] || {}), ...auth };
 
@@ -243,68 +231,24 @@
       bearer: auth.bearerToken,
       csrf: document.cookie.match(/ct0=([^;]+)/)?.[1] || auth.csrfToken || null
     };
-    const canUseApi = Boolean(credentials.queryId && credentials.bearer && credentials.csrf);
-    const delayMs = Number(settings.unbookmarkDelayMs) > 0 ? Number(settings.unbookmarkDelayMs) : DEFAULT_DELAY_MS;
 
-    const rateLog = await recentRemovals();
-    let unbookmarked = 0;
-    let viaUi = 0;
-    let consecutiveFailures = 0;
-    let stoppedReason = null;
-    const failures = [];
-
-    for (let i = 0; i < statusIds.length; i++) {
-      if (rateLog.length >= HOURLY_CAP) {
-        stoppedReason = `Hourly limit reached (${HOURLY_CAP}) — resume later`;
-        break;
-      }
-
-      const sid = statusIds[i];
-      try {
-        if (await unbookmarkViaUi(sid)) {
-          unbookmarked++;
-          viaUi++;
-          await recordRemoval(rateLog);
-          consecutiveFailures = 0;
-        } else if (canUseApi) {
-          await unbookmarkViaApi(sid, credentials);
-          hideArticle(sid); // the page won't do it for us
-          unbookmarked++;
-          await recordRemoval(rateLog);
-          consecutiveFailures = 0;
-        } else {
-          failures.push('Bookmark API details not captured yet — reload the bookmarks page');
-          consecutiveFailures++;
-        }
-      } catch (e) {
-        failures.push(e.message);
-        consecutiveFailures++;
-        if (e.rateLimited) { stoppedReason = e.message; break; }
-      }
-
-      // Something is systematically wrong — stop instead of hammering.
-      if (consecutiveFailures >= CONSECUTIVE_FAILURE_LIMIT) {
-        stoppedReason = `Stopped after ${consecutiveFailures} failures in a row: ${failures[failures.length - 1]}`;
-        break;
-      }
-
-      chrome.runtime.sendMessage({
-        type: 'UNBOOKMARK_PROGRESS', done: i + 1, total: statusIds.length
-      }).catch(() => {});
-
-      if (i < statusIds.length - 1) await sleep(jittered(delayMs));
+    if (!credentials.csrf) {
+      return { ok: false, fatal: 'auth', error: 'Not signed in to X' };
+    }
+    if (!credentials.queryId || !credentials.bearer) {
+      return { ok: false, fatal: 'auth', error: 'Bookmark API details not captured — reload the bookmarks page' };
     }
 
-    if (failures.length > 0) console.warn('[XBMS] unbookmark failures:', failures.slice(0, 5));
-    console.log(`[XBMS] unbookmarked ${unbookmarked}/${statusIds.length} (${viaUi} via X's own button)${stoppedReason ? ' — ' + stoppedReason : ''}`);
-
-    return {
-      ok: unbookmarked > 0 || statusIds.length === 0,
-      unbookmarked,
-      failed: failures.length,
-      stoppedReason,
-      error: stoppedReason || failures[0] || null
-    };
+    try {
+      await unbookmarkViaApi(statusId, credentials);
+      hideArticle(statusId); // the page won't do it for us
+      return { ok: true, via: 'api' };
+    } catch (e) {
+      // A rate limit applies to everything that follows; a missing tweet does not.
+      if (e.rateLimited) return { ok: false, fatal: 'rate-limit', error: e.message };
+      if (isAlreadyGone(e.message)) return { ok: true, via: 'already-gone' };
+      return { ok: false, error: e.message };
+    }
   }
 
   // ── Messages ─────────────────────────────────────────────────────────────────
@@ -320,8 +264,8 @@
     } else if (msg.type === 'IS_BOOKMARKS_PAGE') {
       sendResponse({ isBookmarksPage: checkIfBookmarksPage() });
 
-    } else if (msg.type === 'UNBOOKMARK_ITEMS') {
-      (async () => { sendResponse(await unbookmarkAll(msg.statusIds || [], msg.settings || {})); })();
+    } else if (msg.type === 'UNBOOKMARK_ONE') {
+      (async () => { sendResponse(await unbookmarkOne(msg.statusId)); })();
       return true;
     }
 

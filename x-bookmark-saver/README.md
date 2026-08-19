@@ -104,6 +104,22 @@ or to answer "did I already get this one?"
 
 ---
 
+## Long Jobs
+
+Downloading and un-bookmarking run in the extension's background worker, not in
+the popup. You can close the popup, switch tabs, or use the browser normally
+while a job runs — reopening the popup shows it still going, with progress.
+Only one job runs at a time; turning on "Unbookmark after saving" queues the
+removal run automatically once the download finishes.
+
+Individual failures do not end a run. A tweet that is already un-bookmarked or
+deleted counts as done, and an unexpected error on one tweet is recorded and
+skipped. A run stops early only when something applies to all of it: a rate
+limit, a missing sign-in, no X tab open, the hourly cap, or ten consecutive
+failures.
+
+---
+
 ## Rate Limiting
 
 Removals are writes against your account, so they are paced rather than fired
