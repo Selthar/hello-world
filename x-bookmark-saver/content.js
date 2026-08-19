@@ -9,6 +9,14 @@
   'use strict';
 
   const AUTH_KEY = 'xbms_auth';
+  const RATE_LOG_KEY = 'xbms_unbookmark_log';
+
+  // Removals are writes against your account, so they are paced deliberately.
+  // The cap is a rolling one-hour window, kept in storage so it survives
+  // reloads and applies across every batch.
+  const DEFAULT_DELAY_MS = 2000;
+  const HOURLY_CAP = 200;
+  const CONSECUTIVE_FAILURE_LIMIT = 3;
 
   let isBookmarksPage = false;
   let auth = {};
@@ -148,6 +156,22 @@
 
   const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
+  // Spread requests out so the timing doesn't look metronomic.
+  function jittered(ms) {
+    return Math.round(ms * (0.6 + Math.random() * 0.8));
+  }
+
+  async function recentRemovals() {
+    const stored = await chrome.storage.local.get(RATE_LOG_KEY).catch(() => ({}));
+    const cutoff = Date.now() - 60 * 60 * 1000;
+    return (stored[RATE_LOG_KEY] || []).filter(t => t > cutoff);
+  }
+
+  async function recordRemoval(log) {
+    log.push(Date.now());
+    await chrome.storage.local.set({ [RATE_LOG_KEY]: log }).catch(() => {});
+  }
+
   function findArticle(statusId) {
     for (const article of document.querySelectorAll('article')) {
       if (article.querySelector(`a[href*="/status/${statusId}"]`)) return article;
@@ -196,6 +220,13 @@
       credentials: 'include'
     });
 
+    // Back off completely rather than retrying into a limit.
+    if (resp.status === 429) {
+      const err = new Error('X is rate limiting this account — stopped');
+      err.rateLimited = true;
+      throw err;
+    }
+
     const body = await resp.json().catch(() => null);
     // X answers 200 with an errors[] array on failure, so check both.
     if (!resp.ok || body?.errors?.length) {
@@ -203,7 +234,7 @@
     }
   }
 
-  async function unbookmarkAll(statusIds) {
+  async function unbookmarkAll(statusIds, settings = {}) {
     const stored = await chrome.storage.local.get(AUTH_KEY).catch(() => ({}));
     auth = { ...(stored[AUTH_KEY] || {}), ...auth };
 
@@ -213,38 +244,67 @@
       csrf: document.cookie.match(/ct0=([^;]+)/)?.[1] || auth.csrfToken || null
     };
     const canUseApi = Boolean(credentials.queryId && credentials.bearer && credentials.csrf);
+    const delayMs = Number(settings.unbookmarkDelayMs) > 0 ? Number(settings.unbookmarkDelayMs) : DEFAULT_DELAY_MS;
 
+    const rateLog = await recentRemovals();
     let unbookmarked = 0;
     let viaUi = 0;
+    let consecutiveFailures = 0;
+    let stoppedReason = null;
     const failures = [];
 
     for (let i = 0; i < statusIds.length; i++) {
+      if (rateLog.length >= HOURLY_CAP) {
+        stoppedReason = `Hourly limit reached (${HOURLY_CAP}) — resume later`;
+        break;
+      }
+
       const sid = statusIds[i];
       try {
         if (await unbookmarkViaUi(sid)) {
           unbookmarked++;
           viaUi++;
+          await recordRemoval(rateLog);
+          consecutiveFailures = 0;
         } else if (canUseApi) {
           await unbookmarkViaApi(sid, credentials);
           hideArticle(sid); // the page won't do it for us
           unbookmarked++;
-          await sleep(300); // stay under X's rate limit
+          await recordRemoval(rateLog);
+          consecutiveFailures = 0;
         } else {
           failures.push('Bookmark API details not captured yet — reload the bookmarks page');
+          consecutiveFailures++;
         }
       } catch (e) {
         failures.push(e.message);
+        consecutiveFailures++;
+        if (e.rateLimited) { stoppedReason = e.message; break; }
+      }
+
+      // Something is systematically wrong — stop instead of hammering.
+      if (consecutiveFailures >= CONSECUTIVE_FAILURE_LIMIT) {
+        stoppedReason = `Stopped after ${consecutiveFailures} failures in a row: ${failures[failures.length - 1]}`;
+        break;
       }
 
       chrome.runtime.sendMessage({
         type: 'UNBOOKMARK_PROGRESS', done: i + 1, total: statusIds.length
       }).catch(() => {});
+
+      if (i < statusIds.length - 1) await sleep(jittered(delayMs));
     }
 
     if (failures.length > 0) console.warn('[XBMS] unbookmark failures:', failures.slice(0, 5));
-    console.log(`[XBMS] unbookmarked ${unbookmarked}/${statusIds.length} (${viaUi} via X's own button)`);
+    console.log(`[XBMS] unbookmarked ${unbookmarked}/${statusIds.length} (${viaUi} via X's own button)${stoppedReason ? ' — ' + stoppedReason : ''}`);
 
-    return { ok: failures.length < statusIds.length, unbookmarked, failed: failures.length, error: failures[0] || null };
+    return {
+      ok: unbookmarked > 0 || statusIds.length === 0,
+      unbookmarked,
+      failed: failures.length,
+      stoppedReason,
+      error: stoppedReason || failures[0] || null
+    };
   }
 
   // ── Messages ─────────────────────────────────────────────────────────────────
@@ -261,7 +321,7 @@
       sendResponse({ isBookmarksPage: checkIfBookmarksPage() });
 
     } else if (msg.type === 'UNBOOKMARK_ITEMS') {
-      (async () => { sendResponse(await unbookmarkAll(msg.statusIds || [])); })();
+      (async () => { sendResponse(await unbookmarkAll(msg.statusIds || [], msg.settings || {})); })();
       return true;
     }
 

@@ -90,6 +90,40 @@ back to stitching HLS segments and may be video-only.
 
 ---
 
+## Keeping Track
+
+Un-bookmarking after a save is the tracking mechanism. Removal only runs for
+items that were fetched successfully **and** written to disk — the code waits
+for the zip to finish before touching your bookmarks. Anything that failed
+stays bookmarked, so whatever is left in X is exactly what still needs saving.
+
+Settings → **Export history** writes a CSV of every item the extension has
+seen, with handle, post date, tweet URL, filename, folder and outcome. Open it
+in Excel or Sheets to reconcile a download folder without going back through X,
+or to answer "did I already get this one?"
+
+---
+
+## Rate Limiting
+
+Removals are writes against your account, so they are paced rather than fired
+as fast as possible:
+
+- **One at a time.** Nothing is parallelised.
+- **Randomised gap** between removals, set by Settings → "Unbookmark pace"
+  (default 2s, adjustable 1–15s). The actual wait varies ±40% so the timing is
+  not perfectly regular.
+- **200 per rolling hour**, tracked in storage so the cap holds across batches
+  and browser restarts.
+- **Stops on HTTP 429** instead of retrying into a limit.
+- **Stops after 3 consecutive failures**, rather than continuing through a
+  systematic problem.
+
+Saving media itself is not paced, because those are ordinary CDN reads of files
+your browser would fetch anyway.
+
+---
+
 ## Tips
 
 - **Scroll slowly** to give the extension time to detect media in each tweet

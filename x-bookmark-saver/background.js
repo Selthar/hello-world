@@ -319,6 +319,53 @@ async function fetchHlsVideo(m3u8Url) {
   throw new Error('No playable stream found in master playlist');
 }
 
+// ─── HISTORY EXPORT ──────────────────────────────────────────────────────────
+
+function csvCell(value) {
+  const s = value === null || value === undefined ? '' : String(value);
+  return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+}
+
+function toCsv(rows, columns) {
+  const lines = [columns.join(',')];
+  for (const row of rows) lines.push(columns.map(c => csvCell(row[c])).join(','));
+  return lines.join('\r\n');
+}
+
+// One row per media item the extension has ever seen, so the folder on disk can
+// be reconciled without going back through X.
+async function exportHistory() {
+  const queue = await getQueue();
+  if (queue.length === 0) return { ok: false, error: 'Nothing to export yet' };
+
+  const rows = queue.map(item => ({
+    status: item.status || '',
+    handle: item.username ? `@${item.username}` : '',
+    posted: item.postedAt || '',
+    type: item.type || '',
+    filename: item.filename || '',
+    folder: item.type === 'image' ? 'Images' : 'Videos',
+    tweet_url: item.tweetUrl || '',
+    status_id: item.statusId || '',
+    media_url: item.url || '',
+    error: item.error || ''
+  }));
+
+  rows.sort((a, b) => (a.handle + a.posted).localeCompare(b.handle + b.posted));
+
+  const columns = ['status', 'handle', 'posted', 'type', 'filename', 'folder', 'tweet_url', 'status_id', 'media_url', 'error'];
+  // Excel needs the BOM to read the file as UTF-8.
+  const csv = '\uFEFF' + toCsv(rows, columns);
+  const bytes = new TextEncoder().encode(csv);
+  const dataUrl = await bytesToDataUrl(bytes, 'text/csv');
+
+  const filename = `X-Bookmarks-history-${new Date().toISOString().slice(0, 10)}.csv`;
+  const id = await startDownload({ url: dataUrl, filename, saveAs: false, conflictAction: 'uniquify' });
+  await waitForDownload(id);
+
+  return { ok: true, count: rows.length, filename };
+}
+
 // ─── UNBOOKMARKING ───────────────────────────────────────────────────────────
 
 async function findXTab() {
@@ -328,12 +375,12 @@ async function findXTab() {
     || null;
 }
 
-async function unbookmarkStatusIds(statusIds) {
+async function unbookmarkStatusIds(statusIds, settings = {}) {
   if (statusIds.length === 0) return { ok: true, unbookmarked: 0 };
   const tab = await findXTab();
   if (!tab) return { ok: false, error: 'No X tab open' };
   try {
-    return await chrome.tabs.sendMessage(tab.id, { type: 'UNBOOKMARK_ITEMS', statusIds });
+    return await chrome.tabs.sendMessage(tab.id, { type: 'UNBOOKMARK_ITEMS', statusIds, settings });
   } catch (e) {
     return { ok: false, error: e.message };
   }
@@ -392,7 +439,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             if (unbookmark && succeededItems.length > 0) {
               // One tweet can hold several media items — unbookmark each once.
               const statusIds = [...new Set(succeededItems.map(i => i.statusId).filter(Boolean))];
-              const result = await unbookmarkStatusIds(statusIds);
+              const result = await unbookmarkStatusIds(statusIds, settings);
               unbookmarked = result?.unbookmarked || 0;
               if (!result?.ok) console.warn('[XBMS] unbookmark after save failed:', result?.error);
             }
@@ -409,6 +456,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             }).catch(() => {});
           }
         })();
+
+      } else if (msg.type === 'EXPORT_HISTORY') {
+        sendResponse(await exportHistory());
 
       } else if (msg.type === 'UNBOOKMARK_DOWNLOADED') {
         const queue = await getQueue();

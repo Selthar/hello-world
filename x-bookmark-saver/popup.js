@@ -7,12 +7,17 @@ let isDownloading = false;
 // Settings state — loaded from storage on init
 let settings = {
   batchSize: 50,
-  unbookmarkAfterSave: false
+  unbookmarkAfterSave: false,
+  unbookmarkDelayMs: 2000
 };
 
 const BATCH_MIN = 5;
 const BATCH_MAX = 200;
 const BATCH_STEP = 5;
+
+const DELAY_MIN = 1000;
+const DELAY_MAX = 15000;
+const DELAY_STEP = 1000;
 
 async function loadSettings() {
   const result = await chrome.storage.local.get('xbms_settings');
@@ -30,6 +35,9 @@ function applySettingsToUI() {
   $('toggle-unbookmark').checked = settings.unbookmarkAfterSave;
   $('batch-dec').disabled = settings.batchSize <= BATCH_MIN;
   $('batch-inc').disabled = settings.batchSize >= BATCH_MAX;
+  $('delay-val').textContent = `${Math.round(settings.unbookmarkDelayMs / 1000)}s`;
+  $('delay-dec').disabled = settings.unbookmarkDelayMs <= DELAY_MIN;
+  $('delay-inc').disabled = settings.unbookmarkDelayMs >= DELAY_MAX;
 }
 
 // ─── HELPERS ────────────────────────────────────────────────────────────────
@@ -321,6 +329,31 @@ document.addEventListener('DOMContentLoaded', async () => {
     await saveSettings();
   });
 
+  // Unbookmark pace stepper
+  $('delay-dec').addEventListener('click', async () => {
+    settings.unbookmarkDelayMs = Math.max(DELAY_MIN, settings.unbookmarkDelayMs - DELAY_STEP);
+    applySettingsToUI();
+    await saveSettings();
+  });
+
+  $('delay-inc').addEventListener('click', async () => {
+    settings.unbookmarkDelayMs = Math.min(DELAY_MAX, settings.unbookmarkDelayMs + DELAY_STEP);
+    applySettingsToUI();
+    await saveSettings();
+  });
+
+  // Export history as CSV
+  $('btn-export').addEventListener('click', async () => {
+    const btn = $('btn-export');
+    btn.disabled = true;
+    btn.textContent = 'Exporting...';
+    const result = await sendBg({ type: 'EXPORT_HISTORY' });
+    btn.disabled = false;
+    btn.textContent = 'Export';
+    if (result?.ok) toast(`Exported ${result.count} rows to ${result.filename}`, 'success', 4000);
+    else toast(result?.error || 'Export failed', 'error');
+  });
+
   // Unbookmark toggle
   $('toggle-unbookmark').addEventListener('change', async (e) => {
     settings.unbookmarkAfterSave = e.target.checked;
@@ -349,13 +382,16 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     const resp = await sendContent(tab, {
       type: 'UNBOOKMARK_ITEMS',
-      statusIds: result.statusIds
+      statusIds: result.statusIds,
+      settings
     });
 
     btn.disabled = false;
     btn.textContent = 'Unbookmark';
 
-    if (resp?.unbookmarked > 0) {
+    if (resp?.stoppedReason) {
+      toast(`Stopped at ${resp.unbookmarked} of ${result.count}: ${resp.stoppedReason}`, 'info', 6000);
+    } else if (resp?.unbookmarked > 0) {
       const suffix = resp.failed > 0 ? `, ${resp.failed} failed` : '';
       toast(`Unbookmarked ${resp.unbookmarked} of ${result.count}${suffix} ✓`, resp.failed > 0 ? 'info' : 'success', 4000);
     } else {
