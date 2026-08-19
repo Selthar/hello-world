@@ -119,8 +119,18 @@ as fast as possible:
 - **Stops after 3 consecutive failures**, rather than continuing through a
   systematic problem.
 
-Saving media itself is not paced, because those are ordinary CDN reads of files
-your browser would fetch anyway.
+Media fetches are ordinary CDN reads, but they are paced too:
+
+- **One at a time**, with a randomised gap set by Settings → "Download pace"
+  (default 0.5s, adjustable 0–5s).
+- **Retries transient failures** — 408, 425, 429 and 5xx — up to three attempts
+  with exponential backoff, honouring the server's `Retry-After` header when it
+  sends one. Before this, a single blip marked an item permanently failed.
+- **Other errors fail immediately.** A 404 is not retried; it will not fix
+  itself.
+- **A 429 that survives every retry stops the run.** Whatever was fetched is
+  still zipped and saved, and the untouched items stay queued rather than being
+  burned as failures.
 
 ---
 

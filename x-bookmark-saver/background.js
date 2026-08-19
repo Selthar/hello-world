@@ -4,6 +4,19 @@ importScripts('zipper.js');
 const STORAGE_KEY = 'xbms_queue';
 const DOWNLOADED_KEY = 'xbms_downloaded';
 
+// Media fetches are ordinary CDN reads, but they still go out one at a time
+// with a gap between them, and back off when a server asks us to.
+const DEFAULT_DOWNLOAD_DELAY_MS = 500;
+const FETCH_ATTEMPTS = 3;
+const RETRYABLE_STATUS = new Set([408, 425, 429, 500, 502, 503, 504]);
+
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+// Spread requests out so the timing doesn't look metronomic.
+function jittered(ms) {
+  return Math.round(ms * (0.6 + Math.random() * 0.8));
+}
+
 // Keep a running queue in storage so it persists across popup opens/closes
 async function getQueue() {
   const result = await chrome.storage.local.get(STORAGE_KEY);
@@ -173,23 +186,60 @@ async function downloadItem(item) {
   return waitForDownload(id);
 }
 
-// Fetch a media URL and return its bytes as a Uint8Array
+// Fetch a media URL and return its bytes as a Uint8Array.
+// Retries transient failures with exponential backoff, honouring Retry-After
+// when the server sends one. A 429 that survives every attempt is escalated so
+// the caller can stop the whole run instead of grinding on.
 async function fetchBytes(url) {
-  const resp = await fetch(url, { headers: { 'Referer': 'https://x.com/' } });
-  if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-  return new Uint8Array(await resp.arrayBuffer());
+  let lastError = null;
+
+  for (let attempt = 1; attempt <= FETCH_ATTEMPTS; attempt++) {
+    let resp;
+    try {
+      resp = await fetch(url, { headers: { 'Referer': 'https://x.com/' } });
+    } catch (networkError) {
+      lastError = networkError;
+      if (attempt === FETCH_ATTEMPTS) break;
+      await sleep(jittered(1000 * Math.pow(2, attempt - 1)));
+      continue;
+    }
+
+    if (resp.ok) return new Uint8Array(await resp.arrayBuffer());
+
+    if (!RETRYABLE_STATUS.has(resp.status) || attempt === FETCH_ATTEMPTS) {
+      const err = new Error(`HTTP ${resp.status}`);
+      if (resp.status === 429) err.rateLimited = true;
+      throw err;
+    }
+
+    const retryAfter = parseInt(resp.headers.get('Retry-After') || '', 10);
+    const backoff = Number.isFinite(retryAfter)
+      ? Math.min(retryAfter * 1000, 60000)
+      : 1000 * Math.pow(2, attempt - 1);
+    console.warn(`[XBMS] HTTP ${resp.status} on attempt ${attempt}, waiting ${backoff}ms`);
+    await sleep(jittered(backoff));
+    lastError = new Error(`HTTP ${resp.status}`);
+  }
+
+  throw lastError || new Error('fetch failed');
 }
 
 // Build a zip of all queued items and trigger a single download
-async function downloadAllAsZip(toDownload, onProgress) {
+async function downloadAllAsZip(toDownload, onProgress, settings = {}) {
   const zip = new ZipBuilder();
   let completed = 0;
   let failed = 0;
   const total = toDownload.length;
   const failedItems = [];
   const succeededItems = [];
+  let stoppedReason = null;
 
-  for (const item of toDownload) {
+  const delayMs = Number.isFinite(Number(settings.downloadDelayMs))
+    ? Number(settings.downloadDelayMs)
+    : DEFAULT_DOWNLOAD_DELAY_MS;
+
+  for (let i = 0; i < toDownload.length; i++) {
+    const item = toDownload[i];
     await chrome.storage.local.set({ _keepalive: Date.now() });
     try {
       const bytes = item.url.includes('.m3u8')
@@ -204,13 +254,19 @@ async function downloadAllAsZip(toDownload, onProgress) {
       console.warn(`[XBMS] failed to fetch ${item.type} ${item.filename}:`, err.message, item.url);
       failed++;
       failedItems.push(item);
+      // Rate limited even after backing off — keep what we have and stop, so
+      // the rest stay queued for later rather than burning through as failures.
+      if (err.rateLimited) {
+        stoppedReason = 'X is rate limiting downloads — stopped, remaining items stay queued';
+        break;
+      }
     }
     onProgress({ completed: completed + failed, total, downloaded: completed, failed, lastItemId: item.id });
-    await new Promise(r => setTimeout(r, 50));
+    if (i < toDownload.length - 1 && delayMs > 0) await sleep(jittered(delayMs));
   }
 
   if (succeededItems.length === 0) {
-    return { completed, failed, failedItems, succeededItems };
+    return { completed, failed, failedItems, succeededItems, stoppedReason };
   }
 
   const dataUrl = await bytesToDataUrl(zip.build(), 'application/zip');
@@ -226,7 +282,7 @@ async function downloadAllAsZip(toDownload, onProgress) {
   const id = await startDownload({ url: dataUrl, filename: zipFilename, saveAs: false, conflictAction: 'uniquify' });
   await waitForDownload(id);
 
-  return { completed, failed, failedItems, succeededItems };
+  return { completed, failed, failedItems, succeededItems, stoppedReason };
 }
 
 function bytesToDataUrl(bytes, mimeType) {
@@ -423,17 +479,16 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           if (toDownload.length === 0) return;
 
           try {
-            const { completed, failed, failedItems, succeededItems } = await downloadAllAsZip(
+            const { completed, failed, failedItems, succeededItems, stoppedReason } = await downloadAllAsZip(
               toDownload,
               (progress) => {
                 chrome.runtime.sendMessage({ type: 'DOWNLOAD_PROGRESS', ...progress }).catch(() => {});
-              }
+              },
+              settings
             );
 
-            for (const item of toDownload) {
-              if (failedItems.some(f => f.id === item.id)) await markFailed(item.id, 'fetch error');
-              else await markDownloaded(item.id);
-            }
+            for (const item of succeededItems) await markDownloaded(item.id);
+            for (const item of failedItems) await markFailed(item.id, 'fetch error');
 
             let unbookmarked = 0;
             if (unbookmark && succeededItems.length > 0) {
@@ -446,7 +501,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
             chrome.runtime.sendMessage({
               type: 'DOWNLOAD_DONE',
-              downloaded: completed, failed, unbookmarked, total: toDownload.length
+              downloaded: completed, failed, unbookmarked, stoppedReason, total: toDownload.length
             }).catch(() => {});
 
           } catch (err) {

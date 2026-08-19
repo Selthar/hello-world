@@ -8,7 +8,8 @@ let isDownloading = false;
 let settings = {
   batchSize: 50,
   unbookmarkAfterSave: false,
-  unbookmarkDelayMs: 2000
+  unbookmarkDelayMs: 2000,
+  downloadDelayMs: 500
 };
 
 const BATCH_MIN = 5;
@@ -18,6 +19,10 @@ const BATCH_STEP = 5;
 const DELAY_MIN = 1000;
 const DELAY_MAX = 15000;
 const DELAY_STEP = 1000;
+
+const DL_MIN = 0;
+const DL_MAX = 5000;
+const DL_STEP = 500;
 
 async function loadSettings() {
   const result = await chrome.storage.local.get('xbms_settings');
@@ -35,6 +40,9 @@ function applySettingsToUI() {
   $('toggle-unbookmark').checked = settings.unbookmarkAfterSave;
   $('batch-dec').disabled = settings.batchSize <= BATCH_MIN;
   $('batch-inc').disabled = settings.batchSize >= BATCH_MAX;
+  $('dlpace-val').textContent = settings.downloadDelayMs === 0 ? 'off' : `${(settings.downloadDelayMs / 1000).toFixed(1)}s`;
+  $('dlpace-dec').disabled = settings.downloadDelayMs <= DL_MIN;
+  $('dlpace-inc').disabled = settings.downloadDelayMs >= DL_MAX;
   $('delay-val').textContent = `${Math.round(settings.unbookmarkDelayMs / 1000)}s`;
   $('delay-dec').disabled = settings.unbookmarkDelayMs <= DELAY_MIN;
   $('delay-inc').disabled = settings.unbookmarkDelayMs >= DELAY_MAX;
@@ -255,7 +263,7 @@ async function downloadAll() {
   // Progress/completion comes back via DOWNLOAD_PROGRESS / DOWNLOAD_DONE messages
 }
 
-function finishDownloadAll(downloaded, failed, unbookmarked = 0) {
+function finishDownloadAll(downloaded, failed, unbookmarked = 0, stoppedReason = null) {
   isDownloading = false;
   const btn = $('btn-download-all');
   if (btn) {
@@ -270,6 +278,10 @@ function finishDownloadAll(downloaded, failed, unbookmarked = 0) {
     if (progressFill) progressFill.style.width = '0%';
   }, 1200);
 
+  if (stoppedReason) {
+    toast(`${downloaded} saved — ${stoppedReason}`, 'info', 6000);
+    return;
+  }
   const parts = [`${downloaded} saved`];
   if (failed > 0) parts.push(`${failed} failed`);
   if (unbookmarked > 0) parts.push(`${unbookmarked} unbookmarked`);
@@ -325,6 +337,19 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   $('batch-inc').addEventListener('click', async () => {
     settings.batchSize = Math.min(BATCH_MAX, settings.batchSize + BATCH_STEP);
+    applySettingsToUI();
+    await saveSettings();
+  });
+
+  // Download pace stepper
+  $('dlpace-dec').addEventListener('click', async () => {
+    settings.downloadDelayMs = Math.max(DL_MIN, settings.downloadDelayMs - DL_STEP);
+    applySettingsToUI();
+    await saveSettings();
+  });
+
+  $('dlpace-inc').addEventListener('click', async () => {
+    settings.downloadDelayMs = Math.min(DL_MAX, settings.downloadDelayMs + DL_STEP);
     applySettingsToUI();
     await saveSettings();
   });
@@ -444,6 +469,6 @@ chrome.runtime.onMessage.addListener((msg) => {
     const btn = $('btn-unbookmark-downloaded');
     if (btn?.disabled) btn.textContent = `${msg.done}/${msg.total}`;
   } else if (msg.type === 'DOWNLOAD_DONE') {
-    finishDownloadAll(msg.downloaded, msg.failed, msg.unbookmarked);
+    finishDownloadAll(msg.downloaded, msg.failed, msg.unbookmarked, msg.stoppedReason);
   }
 });
