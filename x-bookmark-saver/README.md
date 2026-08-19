@@ -2,6 +2,8 @@
 
 Automatically detects and saves images, videos, and GIFs from your X (Twitter) bookmarks as you browse them. No login credentials required — runs entirely in your browser.
 
+Files are named `@handle_YYYY-MM-DD_tweetid.ext`, so they sort by author and post date.
+
 ---
 
 ## Installation (takes ~1 minute)
@@ -53,18 +55,38 @@ Since this is a custom extension (not on the Chrome Web Store), you load it in *
 
 ## File Organization
 
-Downloaded files are saved to your default Downloads folder:
+"Download All" produces a single zip in your Downloads folder:
 
 ```
-Downloads/
-└── X-Bookmarks/
-    ├── Images/
-    │   ├── FxA3kP2WYAEz8Kl.jpg
-    │   └── ...
-    └── Videos/
-        ├── 1234567890.mp4
-        └── ...
+X-Bookmarks-2026-08-19_01.zip
+├── Images/
+│   ├── @someartist_2024-03-20_1780000000000000001.jpg
+│   └── @someartist_2024-03-20_1780000000000000001_1.png
+└── Videos/
+    └── @someposter_2024-01-05_1780000000000000002.mp4
 ```
+
+The name carries the poster's handle and the date they posted, followed by the
+tweet ID. Tweets with several images get a trailing index. When a bookmarked
+retweet is saved, the handle and date belong to whoever originally posted the
+media, not the person who retweeted it.
+
+Downloading a single item with the ↓ button writes it straight to
+`X-Bookmarks/Images/` or `X-Bookmarks/Videos/` instead of a zip.
+
+---
+
+## How It Works
+
+The extension reads the same JSON your browser already receives when it loads
+your bookmarks, rather than scraping the page's HTML. That response carries the
+handle, post date, full-resolution image URLs, and direct MP4 video URLs, so
+detection does not break when X changes its markup — which is what broke
+earlier versions.
+
+Videos are saved as the highest-bitrate MP4 X offers, with audio intact. A
+small number of clips (mostly live broadcasts) have no MP4 version; those fall
+back to stitching HLS segments and may be video-only.
 
 ---
 
@@ -89,18 +111,24 @@ Downloads/
 
 ## Troubleshooting
 
-**"Cannot reach page" error when scanning:**
-- Refresh the bookmarks page and try again
-- Make sure you're on `x.com/i/bookmarks` (not just `x.com`)
+**Nothing is detected:**
+- Reload the bookmarks page after installing or updating the extension. The
+  extension has to be running *before* the page requests your bookmarks.
+- Scroll down to load more bookmarks — each batch is captured as it loads.
 
-**Videos not detected:**
-- Some videos require the tweet to be fully loaded — try clicking into individual tweets
-- Twitter's video URLs sometimes change; if a download fails, opening the tweet directly may help
+**Items are skipped:**
+- Anything downloaded before is remembered and not queued twice. Settings →
+  "Clear download history" makes them eligible again.
 
-**Extension not detecting anything:**
-- Make sure you're on the bookmarks page (`/bookmarks` in the URL)
-- Scroll down to load more tweets — the extension detects media as it appears on screen
-- Click "Rescan" in the popup after scrolling
+**Un-bookmarking does nothing:**
+- Keep the X tab open — the request has to come from the page to carry your
+  session.
+- If you see "Bookmark API details not captured yet", reload the bookmarks page
+  and wait a few seconds before retrying.
+
+**A video downloaded without sound:**
+- That clip had no MP4 version and fell back to HLS. Open the tweet directly to
+  save it manually.
 
 ---
 

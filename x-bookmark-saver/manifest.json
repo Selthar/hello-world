@@ -1,22 +1,19 @@
 {
   "manifest_version": 3,
   "name": "X Bookmark Media Saver",
-  "version": "1.31",
-  "description": "Automatically detects and saves images & videos from your X (Twitter) bookmarks as you browse.",
+  "version": "2.0",
+  "description": "Detects and saves images & videos from your X (Twitter) bookmarks, named by author and post date.",
   "permissions": [
     "downloads",
     "storage",
-    "scripting",
     "activeTab",
-    "webRequest",
     "tabs"
   ],
   "host_permissions": [
     "https://x.com/*",
     "https://twitter.com/*",
     "https://pbs.twimg.com/*",
-    "https://video.twimg.com/*",
-    "https://t.co/*"
+    "https://video.twimg.com/*"
   ],
   "background": {
     "service_worker": "background.js"
@@ -24,8 +21,17 @@
   "content_scripts": [
     {
       "matches": ["https://x.com/*", "https://twitter.com/*"],
+      "js": ["interceptor.js"],
+      "run_at": "document_start",
+      "world": "MAIN",
+      "all_frames": false
+    },
+    {
+      "matches": ["https://x.com/*", "https://twitter.com/*"],
       "js": ["content.js"],
-      "run_at": "document_idle"
+      "run_at": "document_start",
+      "world": "ISOLATED",
+      "all_frames": false
     }
   ],
   "action": {

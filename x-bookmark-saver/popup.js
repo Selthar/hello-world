@@ -124,6 +124,8 @@ function renderList() {
           <div class="item-filename" title="${escHtml(item.filename)}">${escHtml(item.filename)}</div>
           <div class="item-meta">
             <span class="item-status ${item.status}">${item.status}</span>
+            ${item.username ? `<span>@${escHtml(item.username)}</span>` : ''}
+            ${item.postedAt ? `<span>${escHtml(item.postedAt)}</span>` : ''}
             ${tweetBadge}
           </div>
         </div>
@@ -245,7 +247,7 @@ async function downloadAll() {
   // Progress/completion comes back via DOWNLOAD_PROGRESS / DOWNLOAD_DONE messages
 }
 
-function finishDownloadAll(downloaded, failed) {
+function finishDownloadAll(downloaded, failed, unbookmarked = 0) {
   isDownloading = false;
   const btn = $('btn-download-all');
   if (btn) {
@@ -260,13 +262,10 @@ function finishDownloadAll(downloaded, failed) {
     if (progressFill) progressFill.style.width = '0%';
   }, 1200);
 
-  toast(
-    failed > 0
-      ? `Done! ${downloaded} saved, ${failed} failed`
-      : `All ${downloaded} files downloaded! ✓`,
-    failed > 0 ? 'info' : 'success',
-    3500
-  );
+  const parts = [`${downloaded} saved`];
+  if (failed > 0) parts.push(`${failed} failed`);
+  if (unbookmarked > 0) parts.push(`${unbookmarked} unbookmarked`);
+  toast(parts.join(', '), failed > 0 ? 'info' : 'success', 3500);
 }
 
 async function clearQueue() {
@@ -359,7 +358,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (resp?.ok) {
       toast(`Unbookmarked ${resp.unbookmarked} of ${result.count} tweets ✓`, 'success', 4000);
     } else {
-      toast('Unbookmark failed — try refreshing X and trying again', 'error', 4000);
+      toast(resp?.error || 'Unbookmark failed — reload X and try again', 'error', 4500);
     }
   });
 
@@ -397,20 +396,14 @@ document.addEventListener('DOMContentLoaded', async () => {
 
 // Listen for progress/completion from background while popup is open
 chrome.runtime.onMessage.addListener((msg) => {
-  if (msg.type === 'MEDIA_DETECTED') {
-    loadQueue();
-  } else if (msg.type === 'DOWNLOAD_PROGRESS') {
+  if (msg.type === 'DOWNLOAD_PROGRESS') {
     const progressFill = $('progress-fill');
     if (progressFill && msg.total > 0) {
       progressFill.style.width = `${(msg.completed / msg.total) * 100}%`;
     }
-    // Update the item's status in local state
-    const idx = allQueue.findIndex(i => i.id === msg.lastItemId);
-    if (idx !== -1) {
-      allQueue[idx] = { ...allQueue[idx], status: msg.lastStatus };
-    }
-    renderList();
+  } else if (msg.type === 'QUEUE_UPDATED') {
+    loadQueue();
   } else if (msg.type === 'DOWNLOAD_DONE') {
-    finishDownloadAll(msg.downloaded, msg.failed);
+    finishDownloadAll(msg.downloaded, msg.failed, msg.unbookmarked);
   }
 });
