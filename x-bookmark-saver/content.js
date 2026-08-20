@@ -216,6 +216,52 @@
     return /not ?found|does not exist|no status found|already/i.test(message || '');
   }
 
+  // Restoring a bookmark. X exposes CreateBookmark alongside DeleteBookmark and
+  // the interceptor captures both query ids, so anything the extension removed
+  // can be put back as long as its tweet id is still in the queue.
+  async function rebookmarkOne(statusId) {
+    const stored = await chrome.storage.local.get(AUTH_KEY).catch(() => ({}));
+    auth = { ...(stored[AUTH_KEY] || {}), ...auth };
+
+    const queryId = auth.CreateBookmarkQueryId;
+    const bearer = auth.bearerToken;
+    const csrf = document.cookie.match(/ct0=([^;]+)/)?.[1] || auth.csrfToken || null;
+
+    if (!csrf) return { ok: false, fatal: 'auth', error: 'Not signed in to X' };
+    if (!queryId || !bearer) {
+      return { ok: false, fatal: 'auth', error: 'Bookmark API details not captured — reload x.com and try again' };
+    }
+
+    try {
+      const resp = await fetch(`https://x.com/i/api/graphql/${queryId}/CreateBookmark`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${bearer}`,
+          'X-Csrf-Token': csrf,
+          'X-Twitter-Active-User': 'yes',
+          'X-Twitter-Auth-Type': 'OAuth2Session',
+          'X-Twitter-Client-Language': 'en'
+        },
+        body: JSON.stringify({ variables: { tweet_id: statusId }, queryId }),
+        credentials: 'include'
+      });
+
+      if (resp.status === 429) return { ok: false, fatal: 'rate-limit', error: 'X is rate limiting — stopped' };
+
+      const body = await resp.json().catch(() => null);
+      if (!resp.ok || body?.errors?.length) {
+        const message = body?.errors?.[0]?.message || `HTTP ${resp.status}`;
+        // Already bookmarked is the state we want; a deleted tweet cannot come back.
+        if (/already/i.test(message)) return { ok: true, via: 'already-bookmarked' };
+        return { ok: false, error: message };
+      }
+      return { ok: true, via: 'api' };
+    } catch (e) {
+      return { ok: false, error: e.message };
+    }
+  }
+
   async function unbookmarkOne(statusId) {
     try {
       if (await unbookmarkViaUi(statusId)) return { ok: true, via: 'ui' };
@@ -266,6 +312,10 @@
 
     } else if (msg.type === 'UNBOOKMARK_ONE') {
       (async () => { sendResponse(await unbookmarkOne(msg.statusId)); })();
+      return true;
+
+    } else if (msg.type === 'REBOOKMARK_ONE') {
+      (async () => { sendResponse(await rebookmarkOne(msg.statusId)); })();
       return true;
     }
 

@@ -466,57 +466,68 @@ async function recentRemovals() {
   return (stored[RATE_LOG_KEY] || []).filter(t => t > cutoff);
 }
 
-// ─── UNBOOKMARK RUNS ─────────────────────────────────────────────────────────
+// ─── BOOKMARK WRITE RUNS ─────────────────────────────────────────────────────
+//
+// Removing and restoring bookmarks are the same loop with a different message.
+// Both are account writes and share the hourly cap.
 
-let unbookmarkLoopActive = false;
+const RUN_ACTIONS = {
+  unbookmark: { message: 'UNBOOKMARK_ONE' },
+  rebookmark: { message: 'REBOOKMARK_ONE' }
+};
 
-async function startUnbookmarkRun(statusIds, settings = {}) {
-  if (statusIds.length === 0) return { ok: false, error: 'Nothing to unbookmark' };
+let writeLoopActive = false;
+
+async function startWriteRun(kind, statusIds, settings = {}) {
+  if (!RUN_ACTIONS[kind]) return { ok: false, error: `Unknown run type: ${kind}` };
+  if (statusIds.length === 0) return { ok: false, error: 'Nothing to do' };
   const existing = await getRun();
   if (existing?.active) return { ok: false, error: 'A run is already in progress' };
 
   await setRun({
-    kind: 'unbookmark', active: true, ids: statusIds, index: 0,
+    kind, active: true, ids: statusIds, index: 0,
     done: 0, failed: 0, total: statusIds.length,
     settings, startedAt: Date.now(), stoppedReason: null
   });
   startKeepalive();
-  driveUnbookmarkRun();
+  driveWriteRun();
   return { ok: true, started: true, total: statusIds.length };
 }
 
-async function driveUnbookmarkRun() {
-  if (unbookmarkLoopActive) return;
-  unbookmarkLoopActive = true;
+const startUnbookmarkRun = (statusIds, settings) => startWriteRun('unbookmark', statusIds, settings);
+
+async function driveWriteRun() {
+  if (writeLoopActive) return;
+  writeLoopActive = true;
 
   try {
     let consecutiveFailures = 0;
 
     while (true) {
       const run = await getRun();
-      if (!run?.active || run.kind !== 'unbookmark') break;
+      if (!run?.active || !RUN_ACTIONS[run.kind]) break;
 
       if (run.index >= run.ids.length) {
-        await clearRun({ kind: 'unbookmark', done: run.done, failed: run.failed, stoppedReason: null });
+        await clearRun({ kind: run.kind, done: run.done, failed: run.failed, stoppedReason: null });
         break;
       }
 
       const rateLog = await recentRemovals();
       if (rateLog.length >= UNBOOKMARK_HOURLY_CAP) {
-        await stopUnbookmarkRun(run, `Hourly limit reached (${UNBOOKMARK_HOURLY_CAP}) — resume later`);
+        await stopWriteRun(run, `Hourly limit reached (${UNBOOKMARK_HOURLY_CAP}) — resume later`);
         break;
       }
 
       const tab = await findXTab();
       if (!tab) {
-        await stopUnbookmarkRun(run, 'No X tab open — open x.com and start again');
+        await stopWriteRun(run, 'No X tab open — open x.com and start again');
         break;
       }
 
       const statusId = run.ids[run.index];
       let result;
       try {
-        result = await chrome.tabs.sendMessage(tab.id, { type: 'UNBOOKMARK_ONE', statusId });
+        result = await chrome.tabs.sendMessage(tab.id, { type: RUN_ACTIONS[run.kind].message, statusId });
       } catch {
         result = { ok: false, fatal: 'page', error: 'X page not ready — reload it and start again' };
       }
@@ -524,7 +535,7 @@ async function driveUnbookmarkRun() {
       // Anything fatal applies to the whole run; everything else is one tweet's
       // problem and the run carries on.
       if (result?.fatal) {
-        await stopUnbookmarkRun(run, result.error || 'Stopped');
+        await stopWriteRun(run, result.error || 'Stopped');
         break;
       }
 
@@ -534,7 +545,7 @@ async function driveUnbookmarkRun() {
         consecutiveFailures = 0;
       } else {
         consecutiveFailures++;
-        console.warn('[XBMS] unbookmark failed for', statusId, result?.error);
+        console.warn(`[XBMS] ${run.kind} failed for`, statusId, result?.error);
       }
 
       await setRun({
@@ -546,7 +557,7 @@ async function driveUnbookmarkRun() {
 
       if (consecutiveFailures >= CONSECUTIVE_FAILURE_LIMIT) {
         const latest = await getRun();
-        await stopUnbookmarkRun(latest, `Stopped after ${consecutiveFailures} failures in a row: ${result?.error || 'unknown error'}`);
+        await stopWriteRun(latest, `Stopped after ${consecutiveFailures} failures in a row: ${result?.error || 'unknown error'}`);
         break;
       }
 
@@ -556,13 +567,13 @@ async function driveUnbookmarkRun() {
       await sleep(jittered(delay));
     }
   } finally {
-    unbookmarkLoopActive = false;
+    writeLoopActive = false;
   }
 }
 
-async function stopUnbookmarkRun(run, reason) {
-  console.warn('[XBMS] unbookmark run stopped:', reason);
-  await clearRun({ kind: 'unbookmark', done: run?.done || 0, failed: run?.failed || 0, stoppedReason: reason });
+async function stopWriteRun(run, reason) {
+  console.warn(`[XBMS] ${run?.kind || 'run'} stopped:`, reason);
+  await clearRun({ kind: run?.kind || 'unbookmark', done: run?.done || 0, failed: run?.failed || 0, stoppedReason: reason });
 }
 
 // Chrome can shut the worker down mid-run; the alarm brings it back and the
@@ -570,7 +581,7 @@ async function stopUnbookmarkRun(run, reason) {
 chrome.alarms.onAlarm.addListener(async (alarm) => {
   if (alarm.name !== KEEPALIVE_ALARM) return;
   const run = await getRun();
-  if (run?.active && run.kind === 'unbookmark') driveUnbookmarkRun();
+  if (run?.active && RUN_ACTIONS[run.kind]) driveWriteRun();
   else if (!run?.active) chrome.alarms.clear(KEEPALIVE_ALARM);
 });
 
@@ -659,8 +670,16 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           }
         })();
 
+      } else if (msg.type === 'RESTORABLE_IDS') {
+        const queue = await getQueue();
+        const statusIds = [...new Set(queue.map(i => i.statusId).filter(Boolean))];
+        sendResponse({ ok: true, statusIds, count: statusIds.length });
+
+      } else if (msg.type === 'START_REBOOKMARK') {
+        sendResponse(await startWriteRun('rebookmark', msg.statusIds || [], msg.settings || {}));
+
       } else if (msg.type === 'START_UNBOOKMARK') {
-        sendResponse(await startUnbookmarkRun(msg.statusIds || [], msg.settings || {}));
+        sendResponse(await startWriteRun('unbookmark', msg.statusIds || [], msg.settings || {}));
 
       } else if (msg.type === 'GET_RUN') {
         sendResponse({ run: await getRun() });

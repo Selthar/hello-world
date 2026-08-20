@@ -118,6 +118,17 @@ skipped. A run stops early only when something applies to all of it: a rate
 limit, a missing sign-in, no X tab open, the hourly cap, or ten consecutive
 failures.
 
+### Restoring bookmarks
+
+Settings → **Restore bookmarks** re-bookmarks every tweet the extension has a
+record of, using X's own CreateBookmark endpoint. Use it if a removal run took
+more than it should have.
+
+It restores what the extension recorded — the queue is the only list of what it
+touched — so **do not use "Clear download history" or "Full reset" if you may
+need to restore.** Those erase the record. Tweets deleted by their author cannot
+be restored.
+
 ---
 
 ## Rate Limiting

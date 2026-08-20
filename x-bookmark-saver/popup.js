@@ -183,6 +183,8 @@ function renderRun(run) {
     progressFill.style.width = '0%';
     unBtn.disabled = false;
     unBtn.textContent = 'Unbookmark';
+    $('btn-restore').disabled = false;
+    $('btn-restore').textContent = 'Restore';
     dlBtn.innerHTML = `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg> Download All`;
     updateStats();
     return;
@@ -197,7 +199,9 @@ function renderRun(run) {
     dlBtn.innerHTML = `<span class="spinner"></span> Saving ${activeRun.index}/${activeRun.total}`;
   } else {
     unBtn.disabled = true;
-    unBtn.textContent = `${activeRun.index}/${activeRun.total}`;
+    const label = activeRun.kind === 'rebookmark' ? 'btn-restore' : 'btn-unbookmark-downloaded';
+    $(label).disabled = true;
+    $(label).textContent = `${activeRun.index}/${activeRun.total}`;
   }
 }
 
@@ -304,6 +308,12 @@ async function downloadAll() {
 function finishRun(msg) {
   renderRun(null);
   loadQueue();
+
+  if (msg.kind === 'rebookmark') {
+    if (msg.stoppedReason) toast(`Restored ${msg.done} — ${msg.stoppedReason}`, 'info', 6000);
+    else toast(`Restored ${msg.done} bookmarks${msg.failed ? `, ${msg.failed} failed` : ''} ✓`, 'success', 4000);
+    return;
+  }
 
   if (msg.kind === 'unbookmark') {
     if (msg.stoppedReason) toast(`Unbookmarked ${msg.done} — ${msg.stoppedReason}`, 'info', 6000);
@@ -445,6 +455,31 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (started?.ok) {
       await restoreRun();
       toast(`Unbookmarking ${started.total} — you can close this popup`, 'info', 4000);
+    } else {
+      toast(started?.error || 'Could not start', 'error', 4000);
+    }
+  });
+
+  // Restore bookmarks the extension removed
+  $('btn-restore').addEventListener('click', async () => {
+    const tab = await getActiveTab();
+    if (!tab?.url?.includes('x.com') && !tab?.url?.includes('twitter.com')) {
+      toast('Open x.com first — the page is needed to restore', 'error', 3500);
+      return;
+    }
+
+    const result = await sendBg({ type: 'RESTORABLE_IDS' });
+    if (!result?.count) {
+      toast('No recorded tweets to restore', 'info');
+      return;
+    }
+
+    if (!confirm(`Re-bookmark ${result.count} tweet${result.count !== 1 ? 's' : ''} on X?\n\nThis adds back every tweet the extension has a record of, including any that were already bookmarked.`)) return;
+
+    const started = await sendBg({ type: 'START_REBOOKMARK', statusIds: result.statusIds, settings });
+    if (started?.ok) {
+      await restoreRun();
+      toast(`Restoring ${started.total} — you can close this popup`, 'info', 4000);
     } else {
       toast(started?.error || 'Could not start', 'error', 4000);
     }
