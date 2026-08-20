@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "X Bookmark Media Saver",
-  "version": "2.6",
+  "version": "3.0",
   "description": "Detects and saves images & videos from your X (Twitter) bookmarks, named by author and post date.",
   "permissions": [
     "downloads",

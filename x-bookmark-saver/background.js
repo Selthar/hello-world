@@ -4,6 +4,11 @@ importScripts('zipper.js');
 const STORAGE_KEY = 'xbms_queue';
 const DOWNLOADED_KEY = 'xbms_downloaded';
 const RUN_KEY = 'xbms_run';
+// Append-only record of every removal. Deliberately not touched by Clear
+// Queue, Clear History or Full Reset — erasing it is its own action.
+const LEDGER_KEY = 'xbms_removal_ledger';
+const DAILY_KEY = 'xbms_daily';
+const SIZE_STATS_KEY = 'xbms_size_stats';
 const RATE_LOG_KEY = 'xbms_unbookmark_log';
 const KEEPALIVE_ALARM = 'xbms_keepalive';
 
@@ -14,6 +19,8 @@ const DEFAULT_UNBOOKMARK_DELAY_MS = 2000;
 // Generous, and only counts unexpected errors — a tweet that is already gone
 // is not a failure. This exists to catch something systemically broken.
 const CONSECUTIVE_FAILURE_LIMIT = 10;
+// Bounds one wrong click. The hourly cap limits rate; this limits blast radius.
+const DEFAULT_MAX_PER_RUN = 100;
 
 // Media fetches are ordinary CDN reads, but they still go out one at a time
 // with a gap between them, and back off when a server asks us to.
@@ -259,7 +266,7 @@ async function downloadAllAsZip(toDownload, onProgress, settings = {}) {
 
       const folder = item.type === 'image' ? 'Images' : 'Videos';
       zip.addFile(`${folder}/${item.filename || generateFilename(item)}`, bytes);
-      succeededItems.push(item);
+      succeededItems.push({ ...item, bytes: bytes.length });
       completed++;
     } catch (err) {
       console.warn(`[XBMS] failed to fetch ${item.type} ${item.filename}:`, err.message, item.url);
@@ -433,6 +440,73 @@ async function exportHistory() {
   return { ok: true, count: rows.length, filename };
 }
 
+// ─── REMOVAL LEDGER ──────────────────────────────────────────────────────────
+
+async function getLedger() {
+  const result = await chrome.storage.local.get(LEDGER_KEY);
+  return result[LEDGER_KEY] || [];
+}
+
+async function appendLedger(entry) {
+  const ledger = await getLedger();
+  ledger.push(entry);
+  await chrome.storage.local.set({ [LEDGER_KEY]: ledger });
+}
+
+// ─── SIZES AND DAILY TOTALS ──────────────────────────────────────────────────
+
+async function recordSizes(items) {
+  const today = new Date().toISOString().slice(0, 10);
+  const stored = await chrome.storage.local.get([DAILY_KEY, SIZE_STATS_KEY]);
+  const daily = stored[DAILY_KEY] || {};
+  const stats = stored[SIZE_STATS_KEY] || {};
+
+  const day = daily[today] || { items: 0, bytes: 0 };
+  for (const item of items) {
+    const bytes = item.bytes || 0;
+    day.items++;
+    day.bytes += bytes;
+
+    if (bytes > 0) {
+      const bucket = stats[item.type] || { count: 0, bytes: 0 };
+      bucket.count++;
+      bucket.bytes += bytes;
+      stats[item.type] = bucket;
+    }
+  }
+  daily[today] = day;
+
+  // Keep a month of days; the counter only ever shows today.
+  const cutoff = new Date(Date.now() - 31 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+  for (const key of Object.keys(daily)) if (key < cutoff) delete daily[key];
+
+  await chrome.storage.local.set({ [DAILY_KEY]: daily, [SIZE_STATS_KEY]: stats });
+}
+
+// Queued items have no size until they are fetched, so estimate from the
+// average of everything downloaded so far, per media type.
+async function estimateBytes(items) {
+  const stored = await chrome.storage.local.get(SIZE_STATS_KEY);
+  const stats = stored[SIZE_STATS_KEY] || {};
+
+  let known = 0;
+  let estimated = 0;
+  let unknownTypes = 0;
+
+  for (const item of items) {
+    if (item.bytes > 0) { known += item.bytes; continue; }
+    const bucket = stats[item.type];
+    if (bucket?.count > 0) estimated += bucket.bytes / bucket.count;
+    else unknownTypes++;
+  }
+
+  return {
+    bytes: Math.round(known + estimated),
+    sampled: Object.values(stats).reduce((n, s) => n + s.count, 0),
+    unknown: unknownTypes
+  };
+}
+
 // ─── RUN STATE ───────────────────────────────────────────────────────────────
 //
 // Long jobs are owned by the worker, not the popup, and their progress lives in
@@ -484,10 +558,32 @@ async function startWriteRun(kind, statusIds, settings = {}) {
   const existing = await getRun();
   if (existing?.active) return { ok: false, error: 'A run is already in progress' };
 
+  const cap = Number(settings.maxPerRun) > 0 ? Number(settings.maxPerRun) : DEFAULT_MAX_PER_RUN;
+  if (statusIds.length > cap) {
+    return {
+      ok: false,
+      error: `${statusIds.length} exceeds the ${cap}-per-run limit. Raise "Max per run" in Settings if that is intended.`
+    };
+  }
+
+  // Carry handle/date alongside each id so the ledger stays readable even
+  // after the queue is cleared.
+  const queue = await getQueue();
+  const details = {};
+  for (const item of queue) {
+    if (item.statusId && !details[item.statusId]) {
+      details[item.statusId] = {
+        username: item.username || null,
+        postedAt: item.postedAt || null,
+        tweetUrl: item.tweetUrl || null
+      };
+    }
+  }
+
   await setRun({
     kind, active: true, ids: statusIds, index: 0,
     done: 0, failed: 0, total: statusIds.length,
-    settings, startedAt: Date.now(), stoppedReason: null
+    details, settings, startedAt: Date.now(), stoppedReason: null
   });
   startKeepalive();
   driveWriteRun();
@@ -537,6 +633,30 @@ async function driveWriteRun() {
       if (result?.fatal) {
         await stopWriteRun(run, result.error || 'Stopped');
         break;
+      }
+
+      if (run.kind === 'unbookmark') {
+        const record = run.details?.[statusId] || {};
+        await appendLedger({
+          statusId,
+          username: record.username || null,
+          postedAt: record.postedAt || null,
+          tweetUrl: record.tweetUrl || null,
+          at: new Date().toISOString(),
+          via: result?.via || null,
+          result: result?.ok ? 'removed' : 'failed',
+          error: result?.ok ? null : (result?.error || null),
+          restored: false
+        });
+      }
+
+      if (result?.ok && run.kind === 'rebookmark') {
+        const ledger = await getLedger();
+        let changed = false;
+        for (const entry of ledger) {
+          if (entry.statusId === statusId && !entry.restored) { entry.restored = true; changed = true; }
+        }
+        if (changed) await chrome.storage.local.set({ [LEDGER_KEY]: ledger });
       }
 
       if (result?.ok) {
@@ -652,6 +772,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             for (const item of succeededItems) await markDownloaded(item.id);
             for (const item of failedItems) await markFailed(item.id, 'fetch error');
 
+            // Sizes feed both the per-item display and future batch estimates.
+            const sizeById = new Map(succeededItems.map(i => [i.id, i.bytes]));
+            const withSizes = (await getQueue()).map(i =>
+              sizeById.has(i.id) ? { ...i, bytes: sizeById.get(i.id) } : i
+            );
+            await saveQueue(withSizes);
+            await recordSizes(succeededItems);
+
             // Close out the download run before starting the removal run —
             // only one run is active at a time.
             await clearRun({ kind: 'download', done: completed, failed, stoppedReason });
@@ -669,6 +797,58 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             });
           }
         })();
+
+      } else if (msg.type === 'PREVIEW_UNBOOKMARK') {
+        // Dry run: exactly what would be removed, before anything is sent.
+        const queue = await getQueue();
+        const seen = new Map();
+        for (const item of queue) {
+          if (item.status !== 'downloaded' || !item.statusId) continue;
+          if (!seen.has(item.statusId)) {
+            seen.set(item.statusId, {
+              statusId: item.statusId,
+              username: item.username || null,
+              postedAt: item.postedAt || null,
+              tweetUrl: item.tweetUrl || null
+            });
+          }
+        }
+        const preview = [...seen.values()];
+        sendResponse({
+          ok: true,
+          statusIds: preview.map(p => p.statusId),
+          preview,
+          count: preview.length,
+          source: 'items marked downloaded'
+        });
+
+      } else if (msg.type === 'GET_STATS') {
+        const queue = await getQueue();
+        const stored = await chrome.storage.local.get(DAILY_KEY);
+        const today = new Date().toISOString().slice(0, 10);
+        const queued = queue.filter(i => i.status === 'queued');
+        const batch = queued.slice(0, Number(msg.batchSize) || queued.length);
+        sendResponse({
+          ok: true,
+          today: (stored[DAILY_KEY] || {})[today] || { items: 0, bytes: 0 },
+          estimate: await estimateBytes(batch),
+          batchCount: batch.length
+        });
+
+      } else if (msg.type === 'EXPORT_LEDGER') {
+        const ledger = await getLedger();
+        if (ledger.length === 0) { sendResponse({ ok: false, error: 'No removals recorded' }); return; }
+        const columns = ['at', 'result', 'statusId', 'username', 'postedAt', 'tweetUrl', 'via', 'restored', 'error'];
+        const csv = '\uFEFF' + toCsv(ledger, columns);
+        const dataUrl = await bytesToDataUrl(new TextEncoder().encode(csv), 'text/csv');
+        const filename = `X-Bookmarks-removals-${new Date().toISOString().slice(0, 10)}.csv`;
+        const id = await startDownload({ url: dataUrl, filename, saveAs: false, conflictAction: 'uniquify' });
+        await waitForDownload(id);
+        sendResponse({ ok: true, count: ledger.length, filename });
+
+      } else if (msg.type === 'ERASE_LEDGER') {
+        await chrome.storage.local.remove(LEDGER_KEY);
+        sendResponse({ ok: true });
 
       } else if (msg.type === 'DIAGNOSTICS') {
         // Deliberately reports only counts and booleans — never tokens.
@@ -693,14 +873,24 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             newestLoggedRemoval: log.length ? new Date(Math.max(...log)).toISOString() : null,
             activeRun: run ? { kind: run.kind, index: run.index, total: run.total } : null,
             hasDeleteQueryId: Boolean(auth.DeleteBookmarkQueryId),
-            hasCreateQueryId: Boolean(auth.CreateBookmarkQueryId)
+            hasCreateQueryId: Boolean(auth.CreateBookmarkQueryId),
+            removalsRecorded: (await getLedger()).length
           }
         });
 
       } else if (msg.type === 'RESTORABLE_IDS') {
-        const queue = await getQueue();
-        const statusIds = [...new Set(queue.map(i => i.statusId).filter(Boolean))];
-        sendResponse({ ok: true, statusIds, count: statusIds.length });
+        const ledger = await getLedger();
+        const fromLedger = [...new Set(
+          ledger.filter(e => e.result === 'removed' && !e.restored).map(e => e.statusId)
+        )];
+        if (fromLedger.length > 0) {
+          sendResponse({ ok: true, statusIds: fromLedger, count: fromLedger.length, source: 'removal record' });
+        } else {
+          // Nothing recorded — fall back to every tweet the queue knows about.
+          const queue = await getQueue();
+          const statusIds = [...new Set(queue.map(i => i.statusId).filter(Boolean))];
+          sendResponse({ ok: true, statusIds, count: statusIds.length, source: 'queue' });
+        }
 
       } else if (msg.type === 'START_REBOOKMARK') {
         sendResponse(await startWriteRun('rebookmark', msg.statusIds || [], msg.settings || {}));

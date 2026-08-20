@@ -90,6 +90,16 @@ back to stitching HLS segments and may be video-only.
 
 ---
 
+## Sizes and Daily Totals
+
+The popup shows how much you have saved today — file count and total size — next
+to the queue counters. Downloaded items show their real size in the list, and
+hovering "Download All" estimates the batch size from the average of everything
+downloaded so far, per media type. The estimate says how many past downloads it
+is based on; with nothing to average yet, it says so rather than guessing.
+
+---
+
 ## Keeping Track
 
 Un-bookmarking after a save is the tracking mechanism. Removal only runs for
@@ -118,16 +128,33 @@ skipped. A run stops early only when something applies to all of it: a rate
 limit, a missing sign-in, no X tab open, the hourly cap, or ten consecutive
 failures.
 
+### Safeguards on removal
+
+Un-bookmarking is the only thing this extension does that changes your account,
+so it is fenced in:
+
+- **Dry run.** Clicking Unbookmark shows the exact list first — handles and post
+  dates, plus where the list came from. Nothing is sent until you approve it.
+- **Max per run.** A hard ceiling, default 100, on removals in a single run. A
+  larger run refuses to start and says so. Separate from the hourly rate cap.
+- **Stop.** A visible Stop button while anything is running, which halts at the
+  current item.
+- **Removal record.** Every removal is written to an append-only ledger — tweet
+  id, handle, post date, URL, timestamp, method and result. Clear Queue, Clear
+  History and Full Reset all leave it alone; erasing it is its own action with
+  its own confirmation. Export it as CSV from Settings.
+
+The record is what makes "what did this touch?" a lookup rather than an
+investigation, and it is what Restore reads from.
+
 ### Restoring bookmarks
 
-Settings → **Restore bookmarks** re-bookmarks every tweet the extension has a
-record of, using X's own CreateBookmark endpoint. Use it if a removal run took
-more than it should have.
+Settings → **Restore bookmarks** re-bookmarks tweets using X's own
+CreateBookmark endpoint. It works from the removal record, so it restores
+exactly what was removed and nothing else, and marks each entry restored as it
+goes. If no removals are recorded it falls back to every tweet in the queue.
 
-It restores what the extension recorded — the queue is the only list of what it
-touched — so **do not use "Clear download history" or "Full reset" if you may
-need to restore.** Those erase the record. Tweets deleted by their author cannot
-be restored.
+Tweets deleted by their author cannot be restored.
 
 ---
 

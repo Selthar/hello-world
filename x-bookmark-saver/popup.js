@@ -10,7 +10,8 @@ let settings = {
   batchSize: 50,
   unbookmarkAfterSave: false,
   unbookmarkDelayMs: 2000,
-  downloadDelayMs: 500
+  downloadDelayMs: 500,
+  maxPerRun: 100
 };
 
 const BATCH_MIN = 5;
@@ -24,6 +25,10 @@ const DELAY_STEP = 1000;
 const DL_MIN = 0;
 const DL_MAX = 5000;
 const DL_STEP = 500;
+
+const CAP_MIN = 10;
+const CAP_MAX = 500;
+const CAP_STEP = 10;
 
 async function loadSettings() {
   const result = await chrome.storage.local.get('xbms_settings');
@@ -44,6 +49,9 @@ function applySettingsToUI() {
   $('dlpace-val').textContent = settings.downloadDelayMs === 0 ? 'off' : `${(settings.downloadDelayMs / 1000).toFixed(1)}s`;
   $('dlpace-dec').disabled = settings.downloadDelayMs <= DL_MIN;
   $('dlpace-inc').disabled = settings.downloadDelayMs >= DL_MAX;
+  $('cap-val').textContent = settings.maxPerRun;
+  $('cap-dec').disabled = settings.maxPerRun <= CAP_MIN;
+  $('cap-inc').disabled = settings.maxPerRun >= CAP_MAX;
   $('delay-val').textContent = `${Math.round(settings.unbookmarkDelayMs / 1000)}s`;
   $('delay-dec').disabled = settings.unbookmarkDelayMs <= DELAY_MIN;
   $('delay-inc').disabled = settings.unbookmarkDelayMs >= DELAY_MAX;
@@ -60,6 +68,15 @@ function toast(msg, type = 'info', duration = 2800) {
 }
 
 function $(id) { return document.getElementById(id); }
+
+function formatBytes(bytes) {
+  if (!bytes || bytes < 1024) return `${bytes || 0} B`;
+  const units = ['KB', 'MB', 'GB'];
+  let value = bytes / 1024;
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) { value /= 1024; unit++; }
+  return `${value < 10 ? value.toFixed(1) : Math.round(value)} ${units[unit]}`;
+}
 
 function sendBg(msg) {
   return new Promise((resolve) => {
@@ -90,10 +107,27 @@ function updateStats() {
   $('stat-queued').textContent = queued;
   $('stat-downloaded').textContent = downloaded;
   $('stat-failed').textContent = failed;
-  $('stat-total').textContent = allQueue.length;
+  refreshStats();
 
   $('btn-download-all').disabled = queued === 0 || isDownloading;
   if (activeRun?.kind === 'unbookmark') $('btn-unbookmark-downloaded').disabled = true;
+}
+
+async function refreshStats() {
+  const result = await sendBg({ type: 'GET_STATS', batchSize: settings.batchSize });
+  if (!result?.ok) return;
+
+  $('stat-today').textContent = result.today.items;
+  $('stat-today-label').textContent = result.today.bytes
+    ? `Saved Today · ${formatBytes(result.today.bytes)}`
+    : 'Saved Today';
+
+  const btn = $('btn-download-all');
+  if (!activeRun && result.batchCount > 0 && result.estimate.sampled > 0) {
+    btn.title = `About ${formatBytes(result.estimate.bytes)} for ${result.batchCount} items (estimated from ${result.estimate.sampled} past downloads)`;
+  } else {
+    btn.title = '';
+  }
 }
 
 function getFilteredItems() {
@@ -144,6 +178,7 @@ function renderList() {
             <span class="item-status ${item.status}">${item.status}</span>
             ${item.username ? `<span>@${escHtml(item.username)}</span>` : ''}
             ${item.postedAt ? `<span>${escHtml(item.postedAt)}</span>` : ''}
+            ${item.bytes ? `<span>${formatBytes(item.bytes)}</span>` : ''}
             ${tweetBadge}
           </div>
         </div>
@@ -177,6 +212,7 @@ function renderRun(run) {
   const progressFill = $('progress-fill');
   const dlBtn = $('btn-download-all');
   const unBtn = $('btn-unbookmark-downloaded');
+  $('btn-stop').style.display = activeRun ? 'flex' : 'none';
 
   if (!activeRun) {
     progressBar.style.display = 'none';
@@ -431,6 +467,27 @@ document.addEventListener('DOMContentLoaded', async () => {
   });
 
   // Unbookmark all downloaded items
+  // Un-bookmarking goes through a dry run — nothing is sent until the exact
+  // list has been shown and approved.
+  let pendingRemoval = null;
+
+  function showPreview(preview, statusIds, source) {
+    pendingRemoval = statusIds;
+    const shown = preview.slice(0, 12);
+    $('preview-title').textContent = `Remove ${statusIds.length} bookmark${statusIds.length !== 1 ? 's' : ''}?`;
+    $('preview-subtitle').textContent = `From ${source}. This cannot be undone from X, but the extension records it.`;
+    $('preview-list').innerHTML = shown.map(item =>
+      `<div>${escHtml(item.username ? '@' + item.username : item.statusId)}${item.postedAt ? ' · ' + escHtml(item.postedAt) : ''}</div>`
+    ).join('') + (preview.length > shown.length
+      ? `<div style="opacity:.7">…and ${preview.length - shown.length} more</div>` : '');
+    $('preview-panel').style.display = 'block';
+  }
+
+  function hidePreview() {
+    pendingRemoval = null;
+    $('preview-panel').style.display = 'none';
+  }
+
   $('btn-unbookmark-downloaded').addEventListener('click', async () => {
     const tab = await getActiveTab();
     if (!tab?.url?.includes('x.com') && !tab?.url?.includes('twitter.com')) {
@@ -438,26 +495,61 @@ document.addEventListener('DOMContentLoaded', async () => {
       return;
     }
 
-    const result = await sendBg({ type: 'UNBOOKMARK_DOWNLOADED' });
-    if (!result?.statusIds?.length) {
+    const result = await sendBg({ type: 'PREVIEW_UNBOOKMARK' });
+    if (!result?.count) {
       toast('No downloaded items to unbookmark', 'info');
       return;
     }
+    showPreview(result.preview, result.statusIds, result.source);
+  });
 
-    if (!confirm(`Unbookmark ${result.count} tweet${result.count !== 1 ? 's' : ''} from X? This cannot be undone.`)) return;
+  $('preview-cancel').addEventListener('click', hidePreview);
 
-    const started = await sendBg({
-      type: 'START_UNBOOKMARK',
-      statusIds: result.statusIds,
-      settings
-    });
+  $('preview-confirm').addEventListener('click', async () => {
+    if (!pendingRemoval) return;
+    const statusIds = pendingRemoval;
+    hidePreview();
 
+    const started = await sendBg({ type: 'START_UNBOOKMARK', statusIds, settings });
     if (started?.ok) {
       await restoreRun();
       toast(`Unbookmarking ${started.total} — you can close this popup`, 'info', 4000);
     } else {
-      toast(started?.error || 'Could not start', 'error', 4000);
+      toast(started?.error || 'Could not start', 'error', 6000);
     }
+  });
+
+  // Stop whatever is running
+  $('btn-stop').addEventListener('click', async () => {
+    await sendBg({ type: 'CANCEL_RUN' });
+    await restoreRun();
+    toast('Stopped', 'info');
+  });
+
+  // Max per run
+  $('cap-dec').addEventListener('click', async () => {
+    settings.maxPerRun = Math.max(CAP_MIN, settings.maxPerRun - CAP_STEP);
+    applySettingsToUI();
+    await saveSettings();
+  });
+
+  $('cap-inc').addEventListener('click', async () => {
+    settings.maxPerRun = Math.min(CAP_MAX, settings.maxPerRun + CAP_STEP);
+    applySettingsToUI();
+    await saveSettings();
+  });
+
+  // Removal record
+  $('btn-export-ledger').addEventListener('click', async () => {
+    const result = await sendBg({ type: 'EXPORT_LEDGER' });
+    if (result?.ok) toast(`Exported ${result.count} removals`, 'success', 4000);
+    else toast(result?.error || 'Export failed', 'info');
+  });
+
+  $('btn-erase-ledger').addEventListener('click', async () => {
+    if (!confirm('Erase the removal record?\n\nThis is the only list of what the extension has removed, and Restore depends on it.')) return;
+    await sendBg({ type: 'ERASE_LEDGER' });
+    toast('Removal record erased', 'info');
   });
 
   // Diagnostics — readable without opening DevTools
