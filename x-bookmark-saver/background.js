@@ -670,6 +670,33 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           }
         })();
 
+      } else if (msg.type === 'DIAGNOSTICS') {
+        // Deliberately reports only counts and booleans — never tokens.
+        const queue = await getQueue();
+        const downloaded = await getDownloaded();
+        const stored = await chrome.storage.local.get(['xbms_auth', RATE_LOG_KEY, RUN_KEY]);
+        const log = stored[RATE_LOG_KEY] || [];
+        const run = stored[RUN_KEY] || null;
+        const auth = stored.xbms_auth || {};
+
+        sendResponse({
+          ok: true,
+          diagnostics: {
+            version: chrome.runtime.getManifest().version,
+            queueItems: queue.length,
+            uniqueTweets: new Set(queue.map(i => i.statusId).filter(Boolean)).size,
+            byStatus: queue.reduce((acc, i) => (acc[i.status] = (acc[i.status] || 0) + 1, acc), {}),
+            bySource: queue.reduce((acc, i) => (acc[i.source || 'unknown'] = (acc[i.source || 'unknown'] || 0) + 1, acc), {}),
+            downloadHistoryIds: downloaded.length,
+            removalsLoggedLastHour: log.length,
+            oldestLoggedRemoval: log.length ? new Date(Math.min(...log)).toISOString() : null,
+            newestLoggedRemoval: log.length ? new Date(Math.max(...log)).toISOString() : null,
+            activeRun: run ? { kind: run.kind, index: run.index, total: run.total } : null,
+            hasDeleteQueryId: Boolean(auth.DeleteBookmarkQueryId),
+            hasCreateQueryId: Boolean(auth.CreateBookmarkQueryId)
+          }
+        });
+
       } else if (msg.type === 'RESTORABLE_IDS') {
         const queue = await getQueue();
         const statusIds = [...new Set(queue.map(i => i.statusId).filter(Boolean))];

@@ -460,6 +460,24 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
   });
 
+  // Diagnostics — readable without opening DevTools
+  $('btn-diagnostics').addEventListener('click', async () => {
+    const result = await sendBg({ type: 'DIAGNOSTICS' });
+    if (!result?.ok) { toast('Could not read diagnostics', 'error'); return; }
+
+    const text = JSON.stringify(result.diagnostics, null, 2);
+    const out = $('diagnostics-out');
+    out.textContent = text;
+    out.style.display = 'block';
+
+    try {
+      await navigator.clipboard.writeText(text);
+      toast('Copied to clipboard', 'success');
+    } catch {
+      toast('Shown below — select and copy', 'info', 4000);
+    }
+  });
+
   // Restore bookmarks the extension removed
   $('btn-restore').addEventListener('click', async () => {
     const tab = await getActiveTab();
