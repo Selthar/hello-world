@@ -6,26 +6,25 @@ Fill in the `TODO` fields once; update when hardware changes.
 ## Always-on server
 
 - **Role:** primary always-on box (rendering, scheduled jobs, self-hosted services)
-- **OS:** TrueNAS (custom build)
-- **TrueNAS edition:** TODO — SCALE (Debian-based) or CORE (FreeBSD-based)
-- **Version:** TODO
-- **CPU:** TODO — model, cores/threads, arch (x86_64 / ARM)
-- **RAM:** TODO — total, and roughly how much is free at idle
-- **Storage:** TODO — pool layout, free space
-- **Hostname / LAN address:** TODO — how to reach it from other devices
+- **OS:** TrueNAS (custom build), SCALE lineage - Debian-based Linux
+- **Version:** 25.x (Goldeye/Fangtooth era). Docker is native since 24.10 Electric Eel.
+- **CPU:** TODO - model, cores/threads
+- **RAM:** TODO - total (8GB+ assumed; ZFS minimum)
+- **Storage:** TODO - pool layout, free space
+- **Hostname / LAN address:** TODO - how to reach it from other devices
 
 ### Container / app runtime
 
-- **Docker or Apps available:** TODO — yes/no, which
-- **Reverse proxy in front:** TODO — none / Traefik / Caddy / nginx
+- **Docker:** yes, native. Docker Compose works directly.
+- **Reverse proxy in front:** TODO - none / Traefik / Caddy / nginx
 - **Ports already in use:** TODO
 
 ### Capability notes
 
-- **Headless Chromium (Playwright/Puppeteer) viable:** TODO — yes/no
-  - Needs ~500MB-1GB RAM per render. TrueNAS CORE (FreeBSD) generally cannot;
-    SCALE with Docker can.
-- **Scheduled jobs:** TrueNAS Cron Jobs (Data Protection -> Cron Jobs)
+- **Headless Chromium (Playwright/Puppeteer):** viable. Runs in a Docker
+  container; needs ~500MB-1GB RAM per render.
+- **Scheduled jobs:** TrueNAS Cron Jobs (Data Protection -> Cron Jobs), or a
+  scheduler inside the container.
 
 ## Network
 
